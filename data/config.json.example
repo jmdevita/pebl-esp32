@@ -1,0 +1,51 @@
+{
+  "device": {
+    "id": "esp32_device_001",
+    "name": "My E-Paper Display"
+  },
+  "wifi": {
+    "ssid": "YOUR_WIFI_SSID",
+    "password": "YOUR_WIFI_PASSWORD",
+    "timeout_ms": 20000,
+    "reconnect_interval_ms": 30000
+  },
+  "server": {
+    "host": "YOUR_SERVER_URL",
+    "port": 443,
+    "path": "/ws-stream",
+    "use_ssl": true
+  },
+  "display": {
+    "width": 212,
+    "height": 104,
+    "rotation": 1,
+    "pins": {
+      "cs": 5,
+      "dc": 17,
+      "rst": 16,
+      "busy": 4,
+      "sclk": 18,
+      "mosi": 23
+    }
+  },
+  "timing": {
+    "heartbeat_interval_ms": 15000,
+    "heartbeat_timeout_ms": 30000,
+    "ws_initial_reconnect_ms": 15000,
+    "ws_max_reconnect_ms": 60000
+  },
+  "security": {
+    "use_aes": true,
+    "aes_key": "YOUR_32_BYTE_HEX_AES_KEY_HERE"
+  },
+  "power": {
+    "sleep_enabled": true,
+    "sleep_duration_min": 5,
+    "battery_pin": 35,
+    "usb_threshold_v": 4.3
+  },
+  "logging": {
+    "default_level": "WARN",
+    "enable_test_commands": false
+  }
+}
