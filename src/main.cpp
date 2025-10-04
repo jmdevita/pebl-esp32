@@ -871,11 +871,16 @@ BatteryStatus getBatteryStatus() {
     }
     pattern_variance /= PATTERN_SAMPLES;
 
-    // USB detection criteria:
-    // 1. High voltage: TP4054 maintains voltage at ~4.25V+ when USB connected
+    // USB detection criteria (prioritized for keeping USB detection when plugged in):
+    // PRIORITY: If USB is plugged in, we MUST detect it as USB (critical - prevents unwanted sleep)
+    // ACCEPTABLE: If USB is unplugged, can take a bit longer to switch to battery mode
+    //
+    // 1. High voltage: TP4054 maintains voltage at ~4.15V+ when USB connected
     // 2. Stable voltage: USB regulated power has very low variance (<0.002V²)
-    // 3. Hysteresis: prevent rapid toggling between states
-    bool highVoltage = (pattern_avg >= 4.25);
+    // 3. Aggressive USB detection, conservative battery detection
+
+    // Lower threshold to catch fully charged battery on USB (4.15V instead of 4.25V)
+    bool highVoltage = (pattern_avg >= 4.15);
     bool stableVoltage = (pattern_variance < 0.002);
 
     // Static state with hysteresis to prevent rapid toggling
@@ -888,13 +893,15 @@ BatteryStatus getBatteryStatus() {
         lastUSBCheckTime = now;
 
         if (lastUSBState) {
-            // Currently detected as USB - require voltage drop below 4.15V to switch to battery
-            // This prevents false battery detection when USB is connected but battery is full
-            lastUSBState = (pattern_avg >= 4.15);
+            // Currently detected as USB - require voltage drop below 3.95V to switch to battery
+            // This is VERY conservative - ensures we don't falsely switch to battery while USB connected
+            // Even a fully charged battery on USB should stay above 4.0V due to trickle charging
+            lastUSBState = (pattern_avg >= 3.95);
         } else {
-            // Currently detected as battery - require BOTH high voltage AND stability for USB
-            // This prevents false USB detection from a fully charged battery
-            lastUSBState = (highVoltage && stableVoltage);
+            // Currently detected as battery - be AGGRESSIVE about switching to USB
+            // Any sign of high voltage OR very stable voltage = assume USB
+            // This ensures we quickly detect USB connection
+            lastUSBState = (highVoltage || stableVoltage);
         }
 
         char usbLogBuf[128];
@@ -1947,7 +1954,7 @@ void setup() {
                     logMessage(LOG_INFO, "RTC", "Redrawing last reaction from RTC memory");
 
                     // Create JSON object from RTC memory to pass to showReaction
-                    StaticJsonDocument<512> doc;
+                    JsonDocument doc;
                     doc["emoji"] = lastReaction.emoji;
                     doc["emoji_url"] = lastReaction.emojiUrl;
                     doc["user"] = lastReaction.user;
