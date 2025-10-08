@@ -1,7 +1,9 @@
 #include <Arduino.h>
 #include <WiFi.h>
+#include <WiFiManager.h>
 #include <WebSocketsClient.h>
 #include <ArduinoJson.h>
+#include <qrcode.h>
 
 // Conditional display library includes based on build flags
 #ifdef DISPLAY_4G_GRAYSCALE
@@ -96,6 +98,43 @@ namespace DisplayLimits {
     // Emoji position: leaves space for lock icon (top-left) and battery indicator (top-right)
     constexpr int16_t EMOJI_X = 10;  // 10px from left
     constexpr int16_t EMOJI_Y = 38;  // 38px from top (moved down for spacing)
+}
+
+// ============================================================================
+// Battery Management Constants
+// ============================================================================
+namespace BatteryConstants {
+    // No-battery detection thresholds
+    constexpr int NO_BATTERY_VARIANCE_THRESHOLD = 500;     // Max ADC variance for valid battery
+    constexpr int NO_BATTERY_MIN_ADC = 100;                // Min ADC reading (below = disconnected)
+    constexpr int NO_BATTERY_MAX_ADC = 4000;               // Max ADC reading (above = floating)
+    constexpr float NO_BATTERY_MIN_VOLTAGE = 2.5f;         // Min voltage for valid LiPo
+    constexpr float NO_BATTERY_MAX_VOLTAGE = 5.5f;         // Max voltage (allows for USB 5V)
+
+    // USB detection thresholds (MakerFocus 3.7V 2000mAh LiPo with TP4054 charger)
+    // Hysteresis prevents oscillation: different thresholds for each direction
+    constexpr float USB_HIGH_VOLTAGE_THRESHOLD = 4.05f;    // Battery→USB: Detect while charging (87%+)
+    constexpr float USB_TO_BATTERY_THRESHOLD = 4.15f;      // USB→Battery: Require drop to 4.15V
+    constexpr float BATTERY_LOW_VOLTAGE_THRESHOLD = 3.85f; // Deprecated - using hysteresis instead
+    constexpr float VOLTAGE_STABILITY_THRESHOLD = 0.002f;  // USB has very low variance (<0.002V²)
+
+    // LiPo voltage range (MakerFocus specs + Adafruit data)
+    constexpr float LIPO_MAX_VOLTAGE = 4.2f;               // Fully charged
+    constexpr float LIPO_NOMINAL_VOLTAGE = 3.7f;           // Nominal (~50% capacity)
+    constexpr float LIPO_DEAD_VOLTAGE = 3.4f;              // "Dead" battery per Adafruit
+    constexpr float LIPO_CUTOFF_VOLTAGE = 3.0f;            // Protection board cutoff
+
+    // Sleep thresholds
+    constexpr int LOW_BATTERY_SLEEP_THRESHOLD = 15;        // Sleep immediately below 15% (balanced runtime vs longevity)
+    constexpr unsigned long GRACE_PERIOD_MS = 60000;       // 60s grace after switching to battery
+    constexpr unsigned long MAX_BATTERY_RUNTIME_MS = 120000; // 2min max runtime on battery
+
+    // ADC configuration
+    constexpr int ADC_SAMPLE_COUNT = 10;                   // Samples for averaging
+    constexpr int ADC_SAMPLE_DELAY_MS = 5;                 // Delay between samples
+    constexpr float ADC_VOLTAGE_DIVIDER = 2.0f;            // 2:1 voltage divider
+    constexpr float ADC_MAX_VOLTAGE = 3.6f;                // ESP32 ADC max voltage
+    constexpr int ADC_RESOLUTION = 4095;                   // 12-bit ADC (0-4095)
 }
 
 // ============================================================================
@@ -387,7 +426,7 @@ private:
 
         while (http.connected() && downloadSize < downloadCapacity) {
             // Timeout check: 10 second maximum for download
-            if (millis() - downloadStart > 10000) {
+            if ((unsigned long)(millis() - downloadStart) > 10000) {
                 char logBuf[64];
                 snprintf(logBuf, sizeof(logBuf), "downloaded=%zu/%zu bytes", downloadSize, downloadCapacity);
                 logMessage(LOG_ERROR, "EMOJI", "Download timeout", logBuf);
@@ -491,6 +530,9 @@ public:
         // Show battery status text in top center when on battery power
         // Status varies by battery percentage: BATTERY / LOW BATT / CHARGE NOW
 
+        // TODO: Optimize - currently calls getBatteryStatus() twice (isUSBPowered + getBatteryPercentage)
+        // Should cache BatteryStatus and pass to both drawPowerStatusIndicator and drawBatteryIndicator
+
         if (!isUSBPowered()) {
             int batteryPercentage = getBatteryPercentage();
 
@@ -506,7 +548,7 @@ public:
                 statusText = "BATTERY";     // Normal (>=20%)
             }
 
-            display->setFont(nullptr);  // Small font
+            display->setFont(nullptr);  // Small font for status text
             int16_t centerX = display->width() / 2;
 
             // Calculate text width to center it
@@ -516,6 +558,8 @@ public:
 
             display->setCursor(centerX - (w / 2), 8);  // Top center
             display->print(statusText);
+
+            display->setFont(&FreeSans9pt7b);  // Restore font for caller
         }
         // If isUSBPowered() returns true (voltage >= usb_threshold_v from config), show nothing
         // Could be USB or just freshly unplugged battery - we can't tell
@@ -722,6 +766,83 @@ public:
         } while (display->nextPage());
     }
 
+    // Show WiFi provisioning mode with QR code
+    static void showProvisioningMode(const String& ssid, const String& ip) {
+        logMessage(LOG_INFO, "DISPLAY", "Showing provisioning mode");
+
+        if (!display) return;  // Safety check
+
+        // Generate WiFi QR code for iOS 18+/Android 10+ auto-connect
+        String qrData = "WIFI:T:nopass;S:" + ssid + ";P:;;";
+
+        // Initialize QR code (version 3 = 29x29 modules, good for WiFi strings)
+        QRCode qrcode;
+        uint8_t qrcodeData[qrcode_getBufferSize(3)];
+        qrcode_initText(&qrcode, qrcodeData, 3, ECC_LOW, qrData.c_str());
+
+        display->setFullWindow();
+        display->firstPage();
+        do {
+            display->fillScreen(GxEPD_WHITE);
+            display->setTextColor(GxEPD_BLACK);
+
+            // Draw battery indicator and power status
+            drawBatteryIndicator();
+            drawPowerStatusIndicator();
+
+            // Title
+            display->setFont(&FreeSansBold9pt7b);
+            display->setCursor(10, 25);
+            display->print("WiFi Setup");
+
+            // QR Code - positioned on the left side
+            // Scale factor: 2 pixels per module for 29x29 = 58x58 total
+            const uint8_t scale = 2;
+            const uint8_t qrPixelSize = qrcode.size * scale;
+            const int16_t qrX = 10;   // Left margin
+            const int16_t qrY = 46;   // Below title
+
+            // Draw each QR code module
+            for (uint8_t y = 0; y < qrcode.size; y++) {
+                for (uint8_t x = 0; x < qrcode.size; x++) {
+                    uint16_t color = qrcode_getModule(&qrcode, x, y) ? GxEPD_BLACK : GxEPD_WHITE;
+                    display->fillRect(qrX + (x * scale), qrY + (y * scale), scale, scale, color);
+                }
+            }
+
+            // Instructions on the right side of QR code
+            display->setFont(nullptr);  // Small default font
+            const int16_t textX = qrX + qrPixelSize + 7;  // 7px gap from QR code
+            int16_t textY = qrY;  // Align with top of QR code
+
+            display->setCursor(textX, textY);
+            display->print("Network:");
+
+            textY += 10;
+            display->setCursor(textX, textY);
+            display->print(ssid.c_str());
+
+            textY += 15;
+            display->setCursor(textX, textY);
+            display->print("Open browser:");
+
+            textY += 10;
+            display->setCursor(textX, textY);
+            display->print(ip.c_str());
+
+            textY += 15;
+            display->setCursor(textX, textY);
+            display->print("Scan QR or connect");
+
+            textY += 10;
+            display->setCursor(textX, textY);
+            display->print("manually to configure");
+
+        } while (display->nextPage());
+
+        logMessage(LOG_INFO, "DISPLAY", "Provisioning mode displayed");
+    }
+
 private:
     // Smart truncation that accounts for actual rendered text width
     static String truncateToFit(const char* str, const GFXfont* font, int16_t x, int16_t maxWidth) {
@@ -780,6 +901,7 @@ struct BatteryStatus {
 };
 
 BatteryStatus getBatteryStatus() {
+    using namespace BatteryConstants;
     BatteryStatus status = {5.0, -1, -1, false, false};
 
     // Read battery voltage via ADC (LilyGo T5 uses GPIO 35 or 36)
@@ -794,125 +916,127 @@ BatteryStatus getBatteryStatus() {
     delay(10);
     int test_36 = adc1_get_raw(ADC1_CHANNEL_0);
 
-    adc1_channel_t channel = (test_35 > test_36) ? ADC1_CHANNEL_7 : ADC1_CHANNEL_0;
-    adc1_config_channel_atten(channel, ADC_ATTEN_DB_12);
+    // Reject floating pins (reading >= 4000 = likely floating/invalid)
+    // Pick the pin with valid battery range (100-3900)
+    bool pin35_valid = (test_35 >= 100 && test_35 < 4000);
+    bool pin36_valid = (test_36 >= 100 && test_36 < 4000);
 
-    // Average 10 samples for stability
-    int total = 0, min_val = 4095, max_val = 0;
-    for (int i = 0; i < 10; i++) {
-        int reading = adc1_get_raw(channel);
-        total += reading;
-        if (reading < min_val) min_val = reading;
-        if (reading > max_val) max_val = reading;
-        delay(5);
+    adc1_channel_t channel;
+    if (pin35_valid && !pin36_valid) {
+        channel = ADC1_CHANNEL_7;  // Only GPIO35 valid
+    } else if (pin36_valid && !pin35_valid) {
+        channel = ADC1_CHANNEL_0;  // Only GPIO36 valid
+    } else {
+        // Both valid or both invalid - pick higher reading
+        channel = (test_35 > test_36) ? ADC1_CHANNEL_7 : ADC1_CHANNEL_0;
     }
 
-    int adc_avg = total / 10;
+    // Sample voltage multiple times for stability and USB detection
+    // Store raw ADC values to reuse for both percentage and USB detection
+    int rawSamples[ADC_SAMPLE_COUNT];
+    float voltageSamples[ADC_SAMPLE_COUNT];
+    int total = 0, min_val = ADC_RESOLUTION, max_val = 0;
+
+    for (int i = 0; i < ADC_SAMPLE_COUNT; i++) {
+        rawSamples[i] = adc1_get_raw(channel);
+        voltageSamples[i] = (rawSamples[i] / float(ADC_RESOLUTION)) * ADC_MAX_VOLTAGE * ADC_VOLTAGE_DIVIDER;
+
+        total += rawSamples[i];
+        if (rawSamples[i] < min_val) min_val = rawSamples[i];
+        if (rawSamples[i] > max_val) max_val = rawSamples[i];
+
+        delay(ADC_SAMPLE_DELAY_MS);
+    }
+
+    int adc_avg = total / ADC_SAMPLE_COUNT;
     int variance = max_val - min_val;
 
-    // Convert to voltage (12-bit ADC, 3.6V max, 2:1 voltage divider)
-    status.voltage = (adc_avg / 4095.0) * 3.6 * 2.0;
+    // Convert to voltage using averaged ADC reading
+    status.voltage = (adc_avg / float(ADC_RESOLUTION)) * ADC_MAX_VOLTAGE * ADC_VOLTAGE_DIVIDER;
 
-    // Detect no-battery conditions
-    if (variance > 500 || adc_avg < 100 || adc_avg > 4000 ||
-        status.voltage < 2.5 || status.voltage > 4.5) {
+    // Detect no-battery conditions using constants
+    if (variance >= NO_BATTERY_VARIANCE_THRESHOLD ||
+        adc_avg < NO_BATTERY_MIN_ADC ||
+        adc_avg > NO_BATTERY_MAX_ADC ||
+        status.voltage < NO_BATTERY_MIN_VOLTAGE ||
+        status.voltage > NO_BATTERY_MAX_VOLTAGE) {
         status.voltage = 5.0;  // Sentinel value for no battery
-        logMessage(LOG_INFO, "POWER", "No battery detected", "");
+        logMessage(LOG_WARN, "POWER", "No battery detected", "");
         return status;
     }
 
     // Valid battery detected
     status.hasBattery = true;
 
-    // Calculate percentage (LiPo discharge curve: 4.2V=100% -> 3.3V=0%)
+    // Calculate percentage using accurate LiPo discharge curve
+    // Based on MakerFocus 3.7V 2000mAh specs + Adafruit LiPo data
     if (status.voltage >= 4.2) status.percentage = 100;
-    else if (status.voltage >= 4.1) status.percentage = 90;
-    else if (status.voltage >= 4.0) status.percentage = 80;
-    else if (status.voltage >= 3.9) status.percentage = 60;
-    else if (status.voltage >= 3.8) status.percentage = 40;
-    else if (status.voltage >= 3.7) status.percentage = 20;
-    else if (status.voltage >= 3.6) status.percentage = 10;
-    else if (status.voltage >= 3.5) status.percentage = 5;
+    else if (status.voltage >= 4.1) status.percentage = 95;
+    else if (status.voltage >= 4.0) status.percentage = 85;
+    else if (status.voltage >= 3.9) status.percentage = 75;
+    else if (status.voltage >= 3.8) status.percentage = 60;
+    else if (status.voltage >= 3.7) status.percentage = 50;  // NOMINAL - half capacity
+    else if (status.voltage >= 3.6) status.percentage = 35;
+    else if (status.voltage >= 3.5) status.percentage = 20;
+    else if (status.voltage >= 3.4) status.percentage = 10;  // "Dead" per Adafruit
+    else if (status.voltage >= 3.2) status.percentage = 5;   // Near protection cutoff
     else status.percentage = 0;
 
     // Convert to display level (circles: 3=full, 2=medium, 1=low, 0=empty)
-    if (status.percentage >= 80) status.level = 3;
-    else if (status.percentage >= 30) status.level = 2;
-    else if (status.percentage > 0) status.level = 1;
-    else status.level = 0;
+    // More balanced thresholds: 75%/50%/25% boundaries
+    if (status.percentage >= 75) status.level = 3;      // 75-100%
+    else if (status.percentage >= 50) status.level = 2; // 50-74%
+    else if (status.percentage >= 25) status.level = 1; // 25-49%
+    else status.level = 0;                              // 0-24%
 
-    // Detect USB power using enhanced voltage pattern analysis (Option 2)
-    // TP4054 charging IC (used on T5 V2.3) has no I2C or status pins
-    // We analyze voltage behavior to distinguish USB charging from battery alone:
-    // - USB charging: voltage ~4.25-4.3V (charging/maintaining) with very stable readings
-    // - Battery alone: voltage 3.3-4.2V with natural micro-fluctuations
-
-    // Take additional samples to analyze voltage pattern
-    const int PATTERN_SAMPLES = 10;
-    float voltages[PATTERN_SAMPLES];
-    for (int i = 0; i < PATTERN_SAMPLES; i++) {
-        int raw = adc1_get_raw(channel);
-        voltages[i] = (raw / 4095.0) * 3.6 * 2.0;
-        delay(10);  // 10ms between samples = 100ms total
-    }
-
-    // Calculate average voltage from pattern samples
+    // Calculate average voltage and variance from existing samples (reuse!)
     float pattern_avg = 0;
-    for (int i = 0; i < PATTERN_SAMPLES; i++) {
-        pattern_avg += voltages[i];
+    for (int i = 0; i < ADC_SAMPLE_COUNT; i++) {
+        pattern_avg += voltageSamples[i];
     }
-    pattern_avg /= PATTERN_SAMPLES;
+    pattern_avg /= ADC_SAMPLE_COUNT;
 
-    // Calculate voltage variance (measure of stability)
     float pattern_variance = 0;
-    for (int i = 0; i < PATTERN_SAMPLES; i++) {
-        float diff = voltages[i] - pattern_avg;
+    for (int i = 0; i < ADC_SAMPLE_COUNT; i++) {
+        float diff = voltageSamples[i] - pattern_avg;
         pattern_variance += diff * diff;
     }
-    pattern_variance /= PATTERN_SAMPLES;
+    pattern_variance /= ADC_SAMPLE_COUNT;
 
-    // USB detection criteria (prioritized for keeping USB detection when plugged in):
-    // PRIORITY: If USB is plugged in, we MUST detect it as USB (critical - prevents unwanted sleep)
-    // ACCEPTABLE: If USB is unplugged, can take a bit longer to switch to battery mode
-    //
-    // 1. High voltage: TP4054 maintains voltage at ~4.15V+ when USB connected
-    // 2. Stable voltage: USB regulated power has very low variance (<0.002V²)
-    // 3. Aggressive USB detection, conservative battery detection
-
-    // Lower threshold to catch fully charged battery on USB (4.15V instead of 4.25V)
-    bool highVoltage = (pattern_avg >= 4.15);
-    bool stableVoltage = (pattern_variance < 0.002);
+    // USB detection using voltage pattern analysis
+    // TP4054 charging IC has no status pins - must detect via voltage behavior
+    bool highVoltage = (pattern_avg >= USB_HIGH_VOLTAGE_THRESHOLD);
+    bool stableVoltage = (pattern_variance < VOLTAGE_STABILITY_THRESHOLD);
 
     // Static state with hysteresis to prevent rapid toggling
     static bool lastUSBState = false;
     static unsigned long lastUSBCheckTime = 0;
+    static unsigned long lastUSBLogTime = 0;
     unsigned long now = millis();
 
-    // Only update USB state every 3 seconds (called from main loop every 10s anyway)
-    if (now - lastUSBCheckTime >= 3000) {
+    // Only update USB state every 3 seconds (allows voltage to stabilize)
+    if ((unsigned long)(now - lastUSBCheckTime) >= 3000) {
         lastUSBCheckTime = now;
 
         if (lastUSBState) {
-            // Currently detected as USB - require voltage drop below 3.95V to switch to battery
-            // This is VERY conservative - ensures we don't falsely switch to battery while USB connected
-            // Even a fully charged battery on USB should stay above 4.0V due to trickle charging
-            lastUSBState = (pattern_avg >= 3.95);
+            // Currently USB - switch to battery if voltage drops below threshold AND becomes unstable
+            // In hysteresis zone (4.0-4.15V): stability determines state (USB=stable, Battery=unstable)
+            bool inHysteresisZone = (pattern_avg >= USB_HIGH_VOLTAGE_THRESHOLD && pattern_avg < USB_TO_BATTERY_THRESHOLD);
+            if (inHysteresisZone) {
+                // In zone: stay USB if stable (charging), switch to battery if unstable (unplugged)
+                lastUSBState = stableVoltage;
+            } else {
+                // Outside zone: simple voltage check
+                lastUSBState = (pattern_avg >= USB_HIGH_VOLTAGE_THRESHOLD);
+            }
         } else {
-            // Currently detected as battery - be AGGRESSIVE about switching to USB
-            // Any sign of high voltage OR very stable voltage = assume USB
-            // This ensures we quickly detect USB connection
-            lastUSBState = (highVoltage || stableVoltage);
+            // Currently battery - require BOTH high voltage AND stability for USB
+            // Stability check works because getBatteryStatus() is called during WiFi activity
+            // Battery voltage sags under WiFi load (unstable), USB stays regulated (stable)
+            lastUSBState = (highVoltage && stableVoltage);
         }
-
-        char usbLogBuf[128];
-        snprintf(usbLogBuf, sizeof(usbLogBuf),
-                 "pattern_avg=%.3fV variance=%.5f high=%s stable=%s usb=%s",
-                 pattern_avg, pattern_variance,
-                 highVoltage ? "Y" : "N",
-                 stableVoltage ? "Y" : "N",
-                 lastUSBState ? "Y" : "N");
-        logMessage(LOG_INFO, "POWER", "USB detection analysis", usbLogBuf);
     }
+
 
     status.isUSBPowered = lastUSBState;
 
@@ -1612,42 +1736,131 @@ public:
     static bool connectWiFi(bool silent = false) {
         const AppConfig& cfg = ConfigManager::getConfig();
         char logBuf[128];
-        snprintf(logBuf, sizeof(logBuf), "ssid=%s", cfg.wifi.ssid.c_str());
-        logMessage(LOG_INFO, "WIFI", "Connecting", logBuf);
 
-        // Only show WiFi connection screens on first boot, not on wake from sleep
-        if (!silent) {
-            DisplayManager::showMessage("Connecting to", cfg.wifi.ssid);
+        // If no WiFi credentials configured, go straight to provisioning
+        if (cfg.wifi.ssid.isEmpty()) {
+            logMessage(LOG_WARN, "WIFI", "No credentials configured, entering provisioning mode");
+            return startProvisioning();
         }
 
-        WiFi.mode(WIFI_STA);
-        WiFi.begin(cfg.wifi.ssid.c_str(), cfg.wifi.password.c_str());
+        // Try connecting 3 times before entering provisioning mode
+        const int maxRetries = 3;
+        const uint32_t retryDelay = 5000;  // 5 seconds between retries
 
-        const uint32_t startTime = millis();
-        while (WiFi.status() != WL_CONNECTED) {
-            if (millis() - startTime > cfg.wifi.timeout_ms) {
-                logMessage(LOG_ERROR, "WIFI", "Connection timeout");
-                if (!silent) {
-                    DisplayManager::showMessage("WiFi Failed!", "Check settings");
+        for (int attempt = 1; attempt <= maxRetries; attempt++) {
+            snprintf(logBuf, sizeof(logBuf), "attempt=%d/%d ssid=%s", attempt, maxRetries, cfg.wifi.ssid.c_str());
+            logMessage(LOG_INFO, "WIFI", "Connecting", logBuf);
+
+            // Only show WiFi connection screens on first boot, not on wake from sleep
+            if (!silent) {
+                String message = "Connecting";
+                if (attempt > 1) {
+                    message += " (" + String(attempt) + "/" + String(maxRetries) + ")";
                 }
-                return false;
+                DisplayManager::showMessage(message, cfg.wifi.ssid);
             }
-            delay(500);
-            Serial.print('.');
+
+            WiFi.mode(WIFI_STA);
+            WiFi.begin(cfg.wifi.ssid.c_str(), cfg.wifi.password.c_str());
+
+            const uint32_t startTime = millis();
+            while (WiFi.status() != WL_CONNECTED) {
+                if ((unsigned long)(millis() - startTime) > cfg.wifi.timeout_ms) {
+                    logMessage(LOG_WARN, "WIFI", "Connection timeout", logBuf);
+                    break;  // Exit inner loop, will retry
+                }
+                delay(500);
+                Serial.print('.');
+            }
+
+            // Check if connected
+            if (WiFi.status() == WL_CONNECTED) {
+                snprintf(logBuf, sizeof(logBuf), "ip=%s rssi=%d",
+                         WiFi.localIP().toString().c_str(), WiFi.RSSI());
+                logMessage(LOG_INFO, "WIFI", "Connected", logBuf);
+
+                // Only show WiFi connected screen on first boot
+                if (!silent) {
+                    DisplayManager::showMessage("WiFi Connected",
+                                               WiFi.localIP().toString(),
+                                               "",
+                                               "Connecting to server...");
+                }
+                return true;
+            }
+
+            // Failed attempt - wait before retry (unless it's the last attempt)
+            if (attempt < maxRetries) {
+                snprintf(logBuf, sizeof(logBuf), "retry_in=%dms", retryDelay);
+                logMessage(LOG_WARN, "WIFI", "Retrying", logBuf);
+                if (!silent) {
+                    DisplayManager::showMessage("Connection failed", "Retrying...");
+                }
+                delay(retryDelay);
+            }
         }
 
-        snprintf(logBuf, sizeof(logBuf), "ip=%s rssi=%d",
-                 WiFi.localIP().toString().c_str(), WiFi.RSSI());
-        logMessage(LOG_INFO, "WIFI", "Connected", logBuf);
-
-        // Only show WiFi connected screen on first boot
+        // All retries failed - enter provisioning mode
+        logMessage(LOG_ERROR, "WIFI", "All connection attempts failed, entering provisioning mode");
         if (!silent) {
-            DisplayManager::showMessage("WiFi Connected",
+            DisplayManager::showMessage("WiFi Setup", "Starting portal...");
+        }
+        return startProvisioning();
+    }
+
+    static bool startProvisioning() {
+        logMessage(LOG_INFO, "WIFI", "Starting WiFi provisioning mode");
+
+        WiFiManager wm;
+
+        // Set custom AP name
+        const char* apName = "SlackReact-Setup";
+
+        // Configure callback to show provisioning UI on e-paper
+        wm.setAPCallback([](WiFiManager* myWM) {
+            logMessage(LOG_INFO, "WIFI", "Entered provisioning mode");
+            String ssid = myWM->getConfigPortalSSID();
+            String ip = WiFi.softAPIP().toString();
+            DisplayManager::showProvisioningMode(ssid, ip);
+        });
+
+        // Configure callback when WiFi credentials are saved
+        wm.setSaveConfigCallback([]() {
+            logMessage(LOG_INFO, "WIFI", "Credentials saved");
+            DisplayManager::showMessage("WiFi Saved!", "Restarting...");
+        });
+
+        // Set timeout for config portal (3 minutes)
+        wm.setConfigPortalTimeout(180);
+
+        // Try to connect or start AP
+        if (wm.autoConnect(apName)) {
+            // Connected! Save credentials to ConfigManager
+            AppConfig& cfg = ConfigManager::getMutableConfig();
+            cfg.wifi.ssid = WiFi.SSID();
+            cfg.wifi.password = WiFi.psk();
+            ConfigManager::save();
+
+            char logBuf[128];
+            snprintf(logBuf, sizeof(logBuf), "ip=%s ssid=%s",
+                     WiFi.localIP().toString().c_str(), WiFi.SSID().c_str());
+            logMessage(LOG_INFO, "WIFI", "Provisioned and connected", logBuf);
+
+            DisplayManager::showMessage("WiFi Connected!",
                                        WiFi.localIP().toString(),
                                        "",
-                                       "Connecting to server...");
+                                       "Restarting...");
+            delay(2000);
+            ESP.restart();
+            return true;
+        } else {
+            // Timeout or user cancelled
+            logMessage(LOG_ERROR, "WIFI", "Provisioning timeout or cancelled");
+            DisplayManager::showMessage("Setup timeout", "Restarting...");
+            delay(2000);
+            ESP.restart();
+            return false;
         }
-        return true;
     }
 
     static void connectWebSocket() {
@@ -1728,7 +1941,7 @@ private:
     static void checkHeartbeatTimeout() {
         const AppConfig& cfg = ConfigManager::getConfig();
         if (wsConnected && lastHeartbeat > 0) {
-            uint32_t timeSinceHeartbeat = millis() - lastHeartbeat;
+            uint32_t timeSinceHeartbeat = (unsigned long)(millis() - lastHeartbeat);
             // Only disconnect if we haven't received ANY messages (not just heartbeats) for double the timeout
             // The WebSocketsClient has its own ping/pong mechanism that should keep the connection alive
             if (timeSinceHeartbeat > (cfg.timing.heartbeat_timeout_ms * 2)) {
@@ -1925,11 +2138,33 @@ void setup() {
 
     // Check power source at startup
     logMessage(LOG_INFO, "POWER", "Checking power source at startup");
-    bool usbPowered = isUSBPowered();
+    BatteryStatus startupBattery = getBatteryStatus();
+    bool usbPowered = startupBattery.isUSBPowered;
     char powerBuf[128];
-    snprintf(powerBuf, sizeof(powerBuf), "startup_power_source=%s sleep_enabled=%s",
-             usbPowered ? "USB" : "BATTERY", cfg.power.sleep_enabled ? "true" : "false");
+    snprintf(powerBuf, sizeof(powerBuf), "startup_power_source=%s battery=%d%% voltage=%.2fV sleep_enabled=%s",
+             usbPowered ? "USB" : "BATTERY",
+             startupBattery.percentage,
+             startupBattery.voltage,
+             cfg.power.sleep_enabled ? "true" : "false");
     logMessage(LOG_INFO, "POWER", "Startup power status", powerBuf);
+
+    // CRITICAL: Check for low battery on wake BEFORE WiFi connection
+    // WiFi is the most power-hungry operation (~10s × 180mA = 0.5mAh per wake cycle)
+    // If battery is critically low, skip WiFi entirely and go back to sleep
+    if (isWakeFromSleep && cfg.power.sleep_enabled && !usbPowered) {
+        using namespace BatteryConstants;
+        if (startupBattery.percentage >= 0 && startupBattery.percentage < LOW_BATTERY_SLEEP_THRESHOLD) {
+            char logBuf[128];
+            snprintf(logBuf, sizeof(logBuf), "battery=%d%% voltage=%.2fV - skipping WiFi, sleeping immediately",
+                     startupBattery.percentage, startupBattery.voltage);
+            logMessage(LOG_WARN, "POWER", "Critical low battery on wake", logBuf);
+
+            // Sleep immediately without connecting WiFi (saves ~0.5mAh per cycle)
+            enterDeepSleep(cfg.power.sleep_duration_min);
+            // Never returns, but for clarity:
+            return;
+        }
+    }
 
     // Small delay before WiFi connection to let radio stabilize
     logMessage(LOG_INFO, "WIFI", "Waiting for WiFi radio to stabilize");
@@ -1993,6 +2228,22 @@ void setup() {
                     logMessage(LOG_INFO, "DISPLAY", "Blank screen with status bar displayed");
                 }
             }
+
+            // Refresh power status display after WiFi connects (ensures accurate USB detection)
+            // The initial display draw happened before WiFi load, which affects USB detection accuracy
+            delay(500);  // Let WiFi establish and create some load
+            display->setPartialWindow(0, 0, display->width(), 15);
+            display->firstPage();
+            do {
+                display->fillRect(0, 0, display->width(), 15, GxEPD_WHITE);  // Clear top bar
+                DisplayManager::drawBatteryIndicator();
+                DisplayManager::drawPowerStatusIndicator();  // Now with proper WiFi load for accurate detection
+                // Redraw lock icon if encryption enabled
+                if (cfg.security.use_aes && !cfg.security.aes_key.isEmpty()) {
+                    DisplayManager::drawLockIcon();
+                }
+            } while (display->nextPage());
+            logMessage(LOG_INFO, "DISPLAY", "Refreshed power status after WiFi connection");
         }
 
         // Small delay before WebSocket connection
@@ -2054,6 +2305,7 @@ void loop() {
     #endif
 
     // Power management - check if we should sleep
+    using namespace BatteryConstants;
     const AppConfig& cfg = ConfigManager::getConfig();
     if (cfg.power.sleep_enabled) {
         static unsigned long lastPowerCheck = 0;
@@ -2061,56 +2313,99 @@ void loop() {
         static bool wasPreviouslyOnBattery = false;
         unsigned long now = millis();
 
-        // Check power status every 10 seconds
-        if (now - lastPowerCheck > 10000) {
+        // Check power status every 10 seconds (rollover-safe comparison)
+        if ((unsigned long)(now - lastPowerCheck) > 10000) {
             lastPowerCheck = now;
 
-            bool isOnBattery = !isUSBPowered();
+            // Call getBatteryStatus() ONCE and reuse the result (avoid multiple 50ms ADC samplings)
+            BatteryStatus batteryStatus = getBatteryStatus();
+            bool isOnBattery = !batteryStatus.isUSBPowered;
+            int batteryPct = batteryStatus.percentage;
+
+            // Check for critically low battery - sleep immediately (bypass all other logic)
+            if (isOnBattery && batteryPct >= 0 && batteryPct < LOW_BATTERY_SLEEP_THRESHOLD) {
+                char logBuf[128];
+                snprintf(logBuf, sizeof(logBuf), "battery=%d%% voltage=%.2fV - sleeping immediately",
+                         batteryPct, batteryStatus.voltage);  // Use cached voltage
+                logMessage(LOG_WARN, "POWER", "Critical low battery", logBuf);
+                enterDeepSleep(cfg.power.sleep_duration_min);
+                return;  // Never reached, but for clarity
+            }
 
             // Track when we first switched to battery mode
             if (isOnBattery && !wasPreviouslyOnBattery) {
                 batteryModeStartTime = now;
                 wasPreviouslyOnBattery = true;
                 logMessage(LOG_INFO, "POWER", "Switched to battery mode", "starting_grace_period=60s");
+
+                // Update display to show "BATTERY" text at top
+                display->setPartialWindow(0, 0, display->width(), 15);
+                display->firstPage();
+                do {
+                    display->fillRect(0, 0, display->width(), 15, GxEPD_WHITE);  // Clear top bar
+                    DisplayManager::drawBatteryIndicator();
+                    DisplayManager::drawPowerStatusIndicator();
+                    // Redraw lock icon if encryption enabled
+                    if (cfg.security.use_aes && !cfg.security.aes_key.isEmpty()) {
+                        DisplayManager::drawLockIcon();
+                    }
+                } while (display->nextPage());
+
             } else if (!isOnBattery && wasPreviouslyOnBattery) {
                 wasPreviouslyOnBattery = false;
+                batteryModeStartTime = 0;  // Reset timer when switching to USB
                 logMessage(LOG_INFO, "POWER", "Switched to USB mode", "");
+
+                // Update display to remove "BATTERY" text (top bar shows nothing on USB)
+                display->setPartialWindow(0, 0, display->width(), 15);
+                display->firstPage();
+                do {
+                    display->fillRect(0, 0, display->width(), 15, GxEPD_WHITE);  // Clear top bar
+                    DisplayManager::drawBatteryIndicator();
+                    DisplayManager::drawPowerStatusIndicator();  // Shows nothing on USB
+                    // Redraw lock icon if encryption enabled
+                    if (cfg.security.use_aes && !cfg.security.aes_key.isEmpty()) {
+                        DisplayManager::drawLockIcon();
+                    }
+                } while (display->nextPage());
             }
 
             if (isOnBattery) {
+                // Calculate time on battery (rollover-safe)
+                unsigned long timeOnBattery = (unsigned long)(now - batteryModeStartTime);
+
                 // Grace period: Don't sleep for 60 seconds after switching to battery
                 // This prevents immediate sleep when unplugging USB causes brief WebSocket disconnect
-                unsigned long timeOnBattery = now - batteryModeStartTime;
-
-                if (timeOnBattery < 60000) {
+                if (timeOnBattery < GRACE_PERIOD_MS) {
                     char logBuf[128];
                     snprintf(logBuf, sizeof(logBuf), "in_grace_period time_on_battery=%lus", timeOnBattery / 1000);
                     logMessage(LOG_INFO, "POWER", "Battery mode grace period", logBuf);
                 } else {
-                    // After grace period, apply normal sleep logic
-                    // Sleep if no WebSocket connection for 30 seconds
-                    // Or if we've been running for more than 2 minutes on battery
+                    // After grace period, apply sleep logic
                     bool shouldSleep = false;
                     const char* sleepReason = nullptr;
 
-                    if (!wsConnected && (timeOnBattery > 30000)) {
+                    // Sleep if no WebSocket connection (already past grace period)
+                    if (!wsConnected) {
                         shouldSleep = true;
                         sleepReason = "no_connection";
-                    } else if (timeOnBattery > 120000) {  // 2 minutes max run time on battery
+                    }
+                    // Sleep if max runtime on battery exceeded
+                    else if (timeOnBattery > MAX_BATTERY_RUNTIME_MS) {
                         shouldSleep = true;
                         sleepReason = "max_runtime";
                     }
 
                     if (shouldSleep) {
                         char logBuf[128];
-                        snprintf(logBuf, sizeof(logBuf), "reason=%s time_on_battery=%lus wsConnected=%s",
-                                 sleepReason, timeOnBattery / 1000, wsConnected ? "true" : "false");
+                        snprintf(logBuf, sizeof(logBuf), "reason=%s time_on_battery=%lus battery=%d%% wsConnected=%s",
+                                 sleepReason, timeOnBattery / 1000, batteryPct, wsConnected ? "true" : "false");
                         logMessage(LOG_INFO, "POWER", "Battery mode sleep triggered", logBuf);
                         enterDeepSleep(cfg.power.sleep_duration_min);
                     } else {
                         char logBuf[128];
-                        snprintf(logBuf, sizeof(logBuf), "wsConnected=%s time_on_battery=%lus",
-                                 wsConnected ? "true" : "false", timeOnBattery / 1000);
+                        snprintf(logBuf, sizeof(logBuf), "wsConnected=%s time_on_battery=%lus battery=%d%%",
+                                 wsConnected ? "true" : "false", timeOnBattery / 1000, batteryPct);
                         logMessage(LOG_INFO, "POWER", "Battery mode - not sleeping yet", logBuf);
                     }
                 }
