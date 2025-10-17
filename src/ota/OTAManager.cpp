@@ -36,10 +36,10 @@ bool OTAManager::checkForUpdate(FirmwareInfo& info) {
         httpClient.begin(url);
     }
 
-    // Add authentication header (using existing ConfigManager token)
-    if (ConfigManager::getInstance().getApiToken().length() > 0) {
-        httpClient.addHeader("Authorization", "Bearer " + ConfigManager::getInstance().getApiToken());
-    }
+    // TODO: Add authentication when API token feature is implemented
+    // if (ConfigManager::getConfig().security.api_token.length() > 0) {
+    //     httpClient.addHeader("Authorization", "Bearer " + ConfigManager::getConfig().security.api_token);
+    // }
 
     httpClient.setTimeout(10000);  // 10 second timeout
 
@@ -103,10 +103,10 @@ bool OTAManager::downloadAndInstall(const FirmwareInfo& info,
         httpClient.begin(fullUrl);
     }
 
-    // Add authentication
-    if (ConfigManager::getInstance().getApiToken().length() > 0) {
-        httpClient.addHeader("Authorization", "Bearer " + ConfigManager::getInstance().getApiToken());
-    }
+    // TODO: Add authentication when API token feature is implemented
+    // if (ConfigManager::getConfig().security.api_token.length() > 0) {
+    //     httpClient.addHeader("Authorization", "Bearer " + ConfigManager::getConfig().security.api_token);
+    // }
 
     int httpCode = httpClient.GET();
 

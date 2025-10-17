@@ -1422,10 +1422,27 @@ void handleWebSocketMessage(const uint8_t* payload, size_t length) {
     }
 
     if (strcmp(msgType, "error") == 0) {
+        const char* errorCode = doc["code"] | "";
         const char* errorMsg = doc["message"] | "Unknown error";
-        snprintf(logBuf, sizeof(logBuf), "message=\"%s\"", errorMsg);
+        const char* deviceId = doc["device_id"] | "";
+
+        snprintf(logBuf, sizeof(logBuf), "code=%s message=\"%s\"", errorCode, errorMsg);
         logMessage(LOG_ERROR, "WS", "Server error", logBuf);
-        DisplayManager::showMessage("Error:", errorMsg);
+
+        // Show specific screen for registration errors
+        if (strcmp(errorCode, "DEVICE_NOT_REGISTERED") == 0 || strcmp(errorCode, "DEVICE_NOT_LINKED") == 0) {
+            String line1 = "Device not registered";
+            String line2 = deviceId[0] ? String("ID: ") + deviceId : "";
+            String line3 = "Please register via";
+            String line4 = "Slack app or server";
+            DisplayManager::showMessage(line1, line2, line3, line4);
+
+            // Slow down reconnect attempts for unregistered devices
+            delay(10000);  // Wait 10 seconds before reconnecting
+        } else {
+            // Generic error screen
+            DisplayManager::showMessage("Error:", errorMsg);
+        }
         return;
     }
 
@@ -2304,7 +2321,12 @@ void setup() {
 
         // Initialize OTA manager (requires network connectivity)
         logMessage(LOG_INFO, "OTA", "Initializing OTA manager");
-        otaManager = new OTAManager(cfg.server.url, cfg.device.id);
+
+        // Build server URL from config components
+        String serverUrl = String(cfg.server.use_ssl ? "https://" : "http://") +
+                          cfg.server.host + ":" + String(cfg.server.port);
+
+        otaManager = new OTAManager(serverUrl, cfg.device.id);
 
         // Check boot validation (mark new firmware as valid if just updated)
         if (otaManager->checkBootValidation()) {
