@@ -33,6 +33,7 @@
 #include <HTTPClient.h>
 #include <PNGdec.h>
 #include <SPIFFS.h>
+#include "ota/OTAManager.h"
 
 // ============================================================================
 // Power Management
@@ -215,6 +216,15 @@ RTC_DATA_ATTR struct {
     bool isEncrypted = false;
 } lastReaction;
 
+// ============================================================================
+// OTA Update State
+// ============================================================================
+OTAManager* otaManager = nullptr;  // Initialized in setup() after config loaded
+bool pendingUpdate = false;
+String pendingVersion = "";
+unsigned long lastReactionTime = 0;  // Track when last reaction displayed
+unsigned long lastOTACheckMillis = 0;  // millis() when last OTA check performed (NOT RTC - resets on boot)
+
 // Forward declarations
 void handleWebSocketMessage(const uint8_t* payload, size_t length);
 void gracefulShutdown(const char* reason, bool clearDisplay);
@@ -223,6 +233,9 @@ int getBatteryPercentage();
 int getBatteryLevel();
 bool isUSBPowered();
 void injectTestMessage(const String& jsonPayload);
+void checkForFirmwareUpdate();
+void performOTAUpdate();
+bool isDeviceIdle();
 
 // ============================================================================
 // Emoji Renderer - Memory-efficient PNG emoji rendering
@@ -792,7 +805,7 @@ public:
 
             // Title
             display->setFont(&FreeSansBold9pt7b);
-            display->setCursor(10, 25);
+            display->setCursor(10, 28);
             display->print("WiFi Setup");
 
             // QR Code - positioned on the left side
@@ -800,7 +813,7 @@ public:
             const uint8_t scale = 2;
             const uint8_t qrPixelSize = qrcode.size * scale;
             const int16_t qrX = 10;   // Left margin
-            const int16_t qrY = 46;   // Below title
+            const int16_t qrY = 43;   // Below title
 
             // Draw each QR code module
             for (uint8_t y = 0; y < qrcode.size; y++) {
@@ -1364,8 +1377,47 @@ void handleWebSocketMessage(const uint8_t* payload, size_t length) {
     if (strcmp(msgType, "reaction") == 0) {
         metrics.messagesReceived++;
         logMessage(LOG_INFO, "WS", "Reaction received");
+
+        // Extract message ID for ACK
+        const char* messageId = doc["message_id"];
+
+        // Display the reaction
         JsonObject reaction = doc.as<JsonObject>();
         DisplayManager::showReaction(reaction);
+        lastReactionTime = millis();  // Track for idle detection
+
+        // Send ACK back to server
+        if (messageId && wsConnected) {
+            JsonDocument ackDoc;
+            ackDoc["type"] = "ack";
+            ackDoc["id"] = messageId;
+
+            String ackJson;
+            serializeJson(ackDoc, ackJson);
+            webSocket.sendTXT(ackJson);
+
+            snprintf(logBuf, sizeof(logBuf), "id=%s", messageId);
+            logMessage(LOG_DEBUG, "WS", "ACK sent", logBuf);
+        } else if (!messageId) {
+            logMessage(LOG_WARN, "WS", "Message missing message_id field");
+        }
+
+        return;
+    }
+
+    if (strcmp(msgType, "firmware_update") == 0) {
+        logMessage(LOG_INFO, "OTA", "Firmware update notification received");
+        const char* version = doc["version"];
+        bool required = doc["required"] | false;
+
+        if (required) {
+            logMessage(LOG_WARN, "OTA", "Required update - installing immediately");
+            performOTAUpdate();
+        } else {
+            logMessage(LOG_INFO, "OTA", "Optional update - will install when idle");
+            pendingUpdate = true;
+            pendingVersion = String(version ? version : "");
+        }
         return;
     }
 
@@ -2249,6 +2301,26 @@ void setup() {
         // Small delay before WebSocket connection
         delay(2000);
         NetworkManager::connectWebSocket();
+
+        // Initialize OTA manager (requires network connectivity)
+        logMessage(LOG_INFO, "OTA", "Initializing OTA manager");
+        otaManager = new OTAManager(cfg.server.url, cfg.device.id);
+
+        // Check boot validation (mark new firmware as valid if just updated)
+        if (otaManager->checkBootValidation()) {
+            logMessage(LOG_INFO, "OTA", "Boot validation successful - new firmware marked as valid");
+        }
+
+        // Check for firmware updates on power-on boot only (not wake from sleep)
+        // This prevents unnecessary battery drain from checking on every wake cycle
+        // Updates are primarily delivered via WebSocket push notifications
+        if (!isWakeFromSleep) {
+            logMessage(LOG_INFO, "OTA", "Power-on boot - checking for firmware updates");
+            checkForFirmwareUpdate();
+            lastOTACheckMillis = millis();
+        } else {
+            logMessage(LOG_INFO, "OTA", "Wake from sleep - skipping OTA check (updates delivered via WebSocket)");
+        }
     }
 
     logMessage(LOG_INFO, "SYSTEM", "Setup complete");
@@ -2287,6 +2359,22 @@ void loop() {
     // Process queued messages if connection is restored
     if (wsConnected && ResilienceManager::hasQueuedMessages()) {
         ResilienceManager::processQueuedMessages();
+    }
+
+    // OTA Update Management
+    // Periodic check every 24 hours (only for devices that stay awake continuously on USB)
+    // For devices using deep sleep, updates are delivered via WebSocket push or on power-on boot
+    // millis() overflow-safe: subtraction works correctly even after 49 days
+    if (otaManager && (millis() - lastOTACheckMillis) > 24UL * 60UL * 60UL * 1000UL) {
+        logMessage(LOG_INFO, "OTA", "24 hours since last check - checking for updates");
+        checkForFirmwareUpdate();
+        lastOTACheckMillis = millis();
+    }
+
+    // Install pending update when device is idle
+    if (otaManager && pendingUpdate && isDeviceIdle()) {
+        performOTAUpdate();
+        pendingUpdate = false;
     }
 
     #ifdef ENABLE_DEBUG_FEATURES
@@ -2423,4 +2511,122 @@ void loop() {
 
     // Small delay to prevent tight looping
     delay(10);
+}
+
+// ============================================================================
+// OTA Helper Functions
+// ============================================================================
+
+/**
+ * Check for firmware updates from server
+ * Called on boot and periodically every 24 hours
+ */
+void checkForFirmwareUpdate() {
+    if (!otaManager) {
+        logMessage(LOG_ERROR, "OTA", "OTA manager not initialized");
+        return;
+    }
+
+    logMessage(LOG_INFO, "OTA", "Checking for firmware updates");
+
+    OTAManager::FirmwareInfo info;
+    if (otaManager->checkForUpdate(info)) {
+        char logBuf[256];
+        snprintf(logBuf, sizeof(logBuf), "version=%s size=%d required=%s",
+                 info.version.c_str(), info.size, info.required ? "true" : "false");
+        logMessage(LOG_INFO, "OTA", "Update available", logBuf);
+
+        if (info.required) {
+            logMessage(LOG_WARN, "OTA", "Required update - installing immediately");
+            performOTAUpdate();
+        } else {
+            logMessage(LOG_INFO, "OTA", "Optional update - will install when idle");
+            pendingUpdate = true;
+            pendingVersion = info.version;
+        }
+    } else {
+        if (otaManager->getStatus() == OTAManager::OTAStatus::FAILED) {
+            logMessage(LOG_ERROR, "OTA", "Update check failed", otaManager->getLastError().c_str());
+        } else {
+            logMessage(LOG_INFO, "OTA", "No updates available");
+        }
+    }
+}
+
+/**
+ * Perform OTA update
+ * Downloads and installs firmware, then reboots device
+ */
+void performOTAUpdate() {
+    if (!otaManager) {
+        logMessage(LOG_ERROR, "OTA", "OTA manager not initialized");
+        return;
+    }
+
+    logMessage(LOG_INFO, "OTA", "Starting firmware update");
+
+    // Show update message on display
+    if (display) {
+        DisplayManager::showMessage("Firmware Update", "Downloading...", "Please wait");
+    }
+
+    // Get firmware info
+    OTAManager::FirmwareInfo info;
+    if (!otaManager->checkForUpdate(info)) {
+        logMessage(LOG_ERROR, "OTA", "Failed to get firmware info", otaManager->getLastError().c_str());
+        if (display) {
+            DisplayManager::showMessage("Update Failed", "Cannot get firmware info");
+        }
+        return;
+    }
+
+    // Download and install with progress callback
+    bool success = otaManager->downloadAndInstall(info, [](size_t current, size_t total) {
+        // Progress callback - update display every 10%
+        static int lastPercent = -1;
+        int percent = (current * 100) / total;
+        if (percent != lastPercent && percent % 10 == 0) {
+            lastPercent = percent;
+            char buf[32];
+            snprintf(buf, sizeof(buf), "%d%%", percent);
+            logMessage(LOG_INFO, "OTA", "Download progress", buf);
+
+            if (display) {
+                char progressMsg[64];
+                snprintf(progressMsg, sizeof(progressMsg), "Installing... %d%%", percent);
+                DisplayManager::showMessage("Firmware Update", progressMsg, "Please wait");
+            }
+        }
+    });
+
+    if (success) {
+        logMessage(LOG_INFO, "OTA", "Firmware update successful - rebooting");
+        if (display) {
+            DisplayManager::showMessage("Update Complete", "Rebooting...");
+        }
+        delay(2000);
+        ESP.restart();  // Reboot to new firmware
+    } else {
+        logMessage(LOG_ERROR, "OTA", "Firmware update failed", otaManager->getLastError().c_str());
+        if (display) {
+            DisplayManager::showMessage("Update Failed", otaManager->getLastError().c_str());
+        }
+    }
+}
+
+/**
+ * Check if device is idle (no reactions for 5 minutes)
+ * Used to determine when it's safe to perform optional updates
+ */
+bool isDeviceIdle() {
+    const unsigned long IDLE_THRESHOLD_MS = 5UL * 60UL * 1000UL;  // 5 minutes
+
+    // If no reactions yet, consider idle
+    if (lastReactionTime == 0) {
+        return true;
+    }
+
+    // Check if enough time has passed since last reaction
+    unsigned long timeSinceReaction = millis() - lastReactionTime;
+    return timeSinceReaction > IDLE_THRESHOLD_MS;
 }
