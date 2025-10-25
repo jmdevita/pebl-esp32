@@ -33,6 +33,7 @@
 #include <HTTPClient.h>
 #include <PNGdec.h>
 #include <SPIFFS.h>
+#include <time.h>  // For time_t, struct tm, gmtime()
 #include "ota/OTAManager.h"
 
 // ============================================================================
@@ -40,6 +41,15 @@
 // ============================================================================
 RTC_DATA_ATTR int bootCount = 0;  // Persists across deep sleep
 RTC_DATA_ATTR unsigned long lastMessageTime = 0;
+
+// ============================================================================
+// Timezone Management (RTC memory persists across sleep)
+// ============================================================================
+RTC_DATA_ATTR uint16_t wakesSinceTimeSync = 0;      // Wake cycles since last timezone sync
+RTC_DATA_ATTR time_t lastTimeSyncTimestamp = 0;     // Unix timestamp of last sync
+RTC_DATA_ATTR int timezoneOffsetSeconds = 0;        // Timezone offset in seconds (includes DST)
+RTC_DATA_ATTR time_t currentTime = 0;               // Estimated current time (updated each wake)
+RTC_DATA_ATTR bool hasEverSynced = false;           // True if we've successfully synced at least once
 
 // ============================================================================
 // Debug Configuration
@@ -1069,6 +1079,187 @@ int getBatteryLevel() { return getBatteryStatus().level; }
 bool isUSBPowered() { return getBatteryStatus().isUSBPowered; }
 
 // ============================================================================
+// Timezone Management
+// ============================================================================
+
+/**
+ * Fetch timezone information from IPGeolocation.io API
+ * Returns true if successful, false otherwise
+ */
+bool fetchTimezoneFromAPI() {
+    const AppConfig& cfg = ConfigManager::getConfig();
+
+    if (cfg.timezone.api_key.isEmpty()) {
+        logMessage(LOG_WARN, "TIME", "No API key configured, skipping timezone sync");
+        return false;
+    }
+
+    HTTPClient http;
+    http.setTimeout(5000);  // 5 second timeout
+
+    // Build URL with API key
+    String url = cfg.timezone.api_url + "?apiKey=" + cfg.timezone.api_key;
+    http.begin(url);
+
+    char logBuf[128];
+    snprintf(logBuf, sizeof(logBuf), "url=%s", cfg.timezone.api_url.c_str());
+    logMessage(LOG_INFO, "TIME", "Fetching timezone from API", logBuf);
+
+    int httpCode = http.GET();
+
+    if (httpCode == 200) {
+        String response = http.getString();
+        http.end();
+
+        // Parse JSON response
+        JsonDocument doc;
+        DeserializationError error = deserializeJson(doc, response);
+
+        if (error) {
+            snprintf(logBuf, sizeof(logBuf), "error=%s", error.c_str());
+            logMessage(LOG_ERROR, "TIME", "JSON parse error", logBuf);
+            return false;
+        }
+
+        // Extract timezone data
+        // IPGeolocation.io response format:
+        // {
+        //   "date_time_unix": 1761273385.454,
+        //   "timezone": "America/New_York",
+        //   "timezone_offset": -5,
+        //   "timezone_offset_with_dst": -4,
+        //   "is_dst": true
+        // }
+
+        currentTime = doc["date_time_unix"].as<time_t>();
+        timezoneOffsetSeconds = doc["timezone_offset_with_dst"].as<int>() * 3600;  // Convert hours to seconds
+        lastTimeSyncTimestamp = currentTime;
+        wakesSinceTimeSync = 0;
+
+        const char* tzName = doc["timezone"] | "Unknown";
+        bool isDST = doc["is_dst"] | false;
+
+        snprintf(logBuf, sizeof(logBuf),
+                "tz=%s offset=%ds unix=%ld dst=%s",
+                tzName,
+                timezoneOffsetSeconds,
+                currentTime,
+                isDST ? "true" : "false");
+        logMessage(LOG_INFO, "TIME", "Timezone synced successfully", logBuf);
+
+        // Mark that we've successfully synced at least once
+        hasEverSynced = true;
+
+        return true;
+    } else {
+        snprintf(logBuf, sizeof(logBuf), "http_code=%d", httpCode);
+        logMessage(LOG_WARN, "TIME", "API request failed", logBuf);
+        http.end();
+        return false;
+    }
+}
+
+/**
+ * Check if timezone sync is needed
+ * Sync on power-on boot or based on interval (1 hour until first success, then 24 hours)
+ */
+bool shouldSyncTimezone(bool isPowerOnBoot) {
+    const AppConfig& cfg = ConfigManager::getConfig();
+
+    // Always sync on power-on boot
+    if (isPowerOnBoot) {
+        return true;
+    }
+
+    // Use shorter interval (1 hour) until we successfully sync for the first time
+    // Then switch to normal interval (24 hours by default)
+    uint16_t wakesPerSyncInterval;
+    if (!hasEverSynced) {
+        // Never synced - try every hour (12 wakes × 5min = 60min)
+        wakesPerSyncInterval = 12;
+    } else {
+        // Previously synced - use configured interval (default 24 hours = 288 wakes)
+        wakesPerSyncInterval = cfg.timezone.sync_interval_hours * 12;
+    }
+
+    return (wakesSinceTimeSync >= wakesPerSyncInterval);
+}
+
+/**
+ * Update estimated current time based on sleep duration
+ */
+void updateEstimatedTime() {
+    const AppConfig& cfg = ConfigManager::getConfig();
+    currentTime += (cfg.power.sleep_duration_min * 60);
+}
+
+/**
+ * Get current hour in local timezone (0-23)
+ */
+int getCurrentLocalHour() {
+    if (currentTime == 0) {
+        return -1;  // Unknown time
+    }
+
+    time_t localTime = currentTime + timezoneOffsetSeconds;
+    struct tm* timeinfo = gmtime(&localTime);
+
+    // Check for gmtime() failure (unlikely but defensive programming)
+    if (timeinfo == nullptr) {
+        logMessage(LOG_ERROR, "TIME", "gmtime() returned NULL - invalid time value");
+        return -1;
+    }
+
+    return timeinfo->tm_hour;
+}
+
+/**
+ * Check if current time is during quiet hours
+ * Returns true if in quiet hours, false otherwise
+ */
+bool isQuietHours() {
+    const AppConfig& cfg = ConfigManager::getConfig();
+
+    int hour = getCurrentLocalHour();
+    if (hour < 0) {
+        // Time unknown - not in quiet hours (fallback to normal sleep)
+        return false;
+    }
+
+    // Handle quiet hours that span midnight
+    if (cfg.quiet_hours.start_hour > cfg.quiet_hours.end_hour) {
+        // e.g., 23:00 - 07:00
+        return (hour >= cfg.quiet_hours.start_hour || hour < cfg.quiet_hours.end_hour);
+    } else {
+        // e.g., 01:00 - 05:00 (unusual but supported)
+        return (hour >= cfg.quiet_hours.start_hour && hour < cfg.quiet_hours.end_hour);
+    }
+}
+
+/**
+ * Calculate sleep duration in minutes, applying quiet hours multiplier if needed
+ * Returns the sleep duration in minutes
+ */
+uint32_t calculateSleepDuration() {
+    const AppConfig& cfg = ConfigManager::getConfig();
+    uint32_t baseSleepMin = cfg.power.sleep_duration_min;
+
+    if (isQuietHours()) {
+        uint32_t quietSleepMin = baseSleepMin * cfg.quiet_hours.sleep_multiplier;
+        char logBuf[64];
+        snprintf(logBuf, sizeof(logBuf),
+                "base=%dmin multiplier=%dx quiet=%dmin",
+                baseSleepMin,
+                cfg.quiet_hours.sleep_multiplier,
+                quietSleepMin);
+        logMessage(LOG_INFO, "POWER", "Quiet hours active - extended sleep", logBuf);
+        return quietSleepMin;
+    } else {
+        return baseSleepMin;
+    }
+}
+
+// ============================================================================
 // Graceful Shutdown Handler
 // ============================================================================
 // Global flags for sleep state management
@@ -1848,6 +2039,9 @@ public:
                          WiFi.localIP().toString().c_str(), WiFi.RSSI());
                 logMessage(LOG_INFO, "WIFI", "Connected", logBuf);
 
+                // Give DNS servers time to be ready (prevents early OTA check failures)
+                delay(2000);
+
                 // Only show WiFi connected screen on first boot
                 if (!silent) {
                     DisplayManager::showMessage("WiFi Connected",
@@ -2217,6 +2411,22 @@ void setup() {
              cfg.power.sleep_enabled ? "true" : "false");
     logMessage(LOG_INFO, "POWER", "Startup power status", powerBuf);
 
+    // CPU frequency scaling for battery savings
+    // 160MHz provides good balance: ~30% power savings vs 240MHz, minimal performance impact
+    if (cfg.power.sleep_enabled && !usbPowered) {
+        setCpuFrequencyMhz(160);
+        logMessage(LOG_INFO, "POWER", "CPU frequency set to 160MHz for battery savings");
+    } else {
+        // USB powered or sleep disabled - use full speed
+        setCpuFrequencyMhz(240);
+        logMessage(LOG_INFO, "POWER", "CPU frequency set to 240MHz (USB powered or sleep disabled)");
+    }
+
+    // Verify CPU frequency was set correctly
+    char cpuBuf[64];
+    snprintf(cpuBuf, sizeof(cpuBuf), "actual=%dMHz", getCpuFrequencyMhz());
+    logMessage(LOG_INFO, "POWER", "CPU frequency verified", cpuBuf);
+
     // CRITICAL: Check for low battery on wake BEFORE WiFi connection
     // WiFi is the most power-hungry operation (~10s × 180mA = 0.5mAh per wake cycle)
     // If battery is critically low, skip WiFi entirely and go back to sleep
@@ -2229,7 +2439,7 @@ void setup() {
             logMessage(LOG_WARN, "POWER", "Critical low battery on wake", logBuf);
 
             // Sleep immediately without connecting WiFi (saves ~0.5mAh per cycle)
-            enterDeepSleep(cfg.power.sleep_duration_min);
+            enterDeepSleep(calculateSleepDuration());
             // Never returns, but for clarity:
             return;
         }
@@ -2313,6 +2523,54 @@ void setup() {
                 }
             } while (display->nextPage());
             logMessage(LOG_INFO, "DISPLAY", "Refreshed power status after WiFi connection");
+        }
+
+        // Timezone sync logic (after WiFi connected)
+        bool isPowerOnBoot = (wakeup_reason == ESP_SLEEP_WAKEUP_UNDEFINED);
+
+        if (shouldSyncTimezone(isPowerOnBoot)) {
+            char syncBuf[128];
+            if (!hasEverSynced) {
+                snprintf(syncBuf, sizeof(syncBuf), "first_sync_attempt wakes=%d", wakesSinceTimeSync);
+                logMessage(LOG_INFO, "TIME", "Timezone sync needed (never synced)", syncBuf);
+            } else {
+                snprintf(syncBuf, sizeof(syncBuf), "wakes=%d", wakesSinceTimeSync);
+                logMessage(LOG_INFO, "TIME", "Timezone sync needed (scheduled)", syncBuf);
+            }
+
+            if (fetchTimezoneFromAPI()) {
+                // Sync successful
+                char timeBuf[64];
+                int hour = getCurrentLocalHour();
+                snprintf(timeBuf, sizeof(timeBuf), "current_hour=%d quiet_hours=%s",
+                        hour, isQuietHours() ? "yes" : "no");
+                logMessage(LOG_INFO, "TIME", "Timezone sync complete", timeBuf);
+            } else {
+                // Sync failed - increment counter anyway so we don't retry every wake
+                wakesSinceTimeSync++;
+
+                if (!hasEverSynced) {
+                    snprintf(syncBuf, sizeof(syncBuf), "next_retry_in=%d_wakes (~%d_min)",
+                            12 - (wakesSinceTimeSync % 12),
+                            (12 - (wakesSinceTimeSync % 12)) * cfg.power.sleep_duration_min);
+                    logMessage(LOG_WARN, "TIME", "CRITICAL: First timezone sync failed - quiet hours disabled until success", syncBuf);
+                } else {
+                    logMessage(LOG_WARN, "TIME", "Timezone sync failed, will retry at next interval");
+                }
+            }
+        } else {
+            // Update estimated time and increment wake counter
+            updateEstimatedTime();
+            wakesSinceTimeSync++;
+
+            char timeBuf[64];
+            int hour = getCurrentLocalHour();
+            snprintf(timeBuf, sizeof(timeBuf),
+                    "wakes_since_sync=%d next_sync_in=%d current_hour=%d",
+                    wakesSinceTimeSync,
+                    (cfg.timezone.sync_interval_hours * 12) - wakesSinceTimeSync,
+                    hour);
+            logMessage(LOG_DEBUG, "TIME", "Using estimated time", timeBuf);
         }
 
         // Small delay before WebSocket connection
@@ -2438,7 +2696,7 @@ void loop() {
                 snprintf(logBuf, sizeof(logBuf), "battery=%d%% voltage=%.2fV - sleeping immediately",
                          batteryPct, batteryStatus.voltage);  // Use cached voltage
                 logMessage(LOG_WARN, "POWER", "Critical low battery", logBuf);
-                enterDeepSleep(cfg.power.sleep_duration_min);
+                enterDeepSleep(calculateSleepDuration());
                 return;  // Never reached, but for clarity
             }
 
@@ -2511,7 +2769,7 @@ void loop() {
                         snprintf(logBuf, sizeof(logBuf), "reason=%s time_on_battery=%lus battery=%d%% wsConnected=%s",
                                  sleepReason, timeOnBattery / 1000, batteryPct, wsConnected ? "true" : "false");
                         logMessage(LOG_INFO, "POWER", "Battery mode sleep triggered", logBuf);
-                        enterDeepSleep(cfg.power.sleep_duration_min);
+                        enterDeepSleep(calculateSleepDuration());
                     } else {
                         char logBuf[128];
                         snprintf(logBuf, sizeof(logBuf), "wsConnected=%s time_on_battery=%lus battery=%d%%",

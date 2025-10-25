@@ -47,5 +47,15 @@
   "logging": {
     "default_level": "WARN",
     "enable_test_commands": false
+  },
+  "timezone": {
+    "sync_interval_hours": 24,
+    "api_url": "https://api.ipgeolocation.io/timezone",
+    "api_key": "123456"
+  },
+  "quiet_hours": {
+    "start_hour": 23,
+    "end_hour": 7,
+    "sleep_multiplier": 3
   }
 }

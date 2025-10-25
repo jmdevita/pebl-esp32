@@ -71,6 +71,20 @@ struct AppConfig {
         String default_level;
         bool enable_test_commands;
     } logging;
+
+    // Timezone settings
+    struct {
+        uint8_t sync_interval_hours;  // How often to re-sync (default: 24)
+        String api_url;                // Timezone API base URL
+        String api_key;                // API key for timezone service
+    } timezone;
+
+    // Quiet hours settings
+    struct {
+        uint8_t start_hour;           // Start of quiet hours (0-23, default: 23)
+        uint8_t end_hour;             // End of quiet hours (0-23, default: 7)
+        uint8_t sleep_multiplier;     // Sleep multiplier during quiet hours (default: 3)
+    } quiet_hours;
 };
 
 class ConfigManager {

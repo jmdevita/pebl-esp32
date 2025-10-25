@@ -65,6 +65,16 @@ void ConfigManager::setDefaults() {
     // Logging defaults
     config.logging.default_level = "WARN";
     config.logging.enable_test_commands = true;
+
+    // Timezone defaults
+    config.timezone.sync_interval_hours = 24;
+    config.timezone.api_url = "https://api.ipgeolocation.io/timezone";
+    config.timezone.api_key = "420755f05aa14c8f96f8dae5d8176022";  // IPGeolocation.io free tier
+
+    // Quiet hours defaults
+    config.quiet_hours.start_hour = 23;  // 11 PM
+    config.quiet_hours.end_hour = 7;     // 7 AM
+    config.quiet_hours.sleep_multiplier = 3;  // 3x sleep duration during quiet hours
 }
 
 bool ConfigManager::begin() {
@@ -134,14 +144,14 @@ bool ConfigManager::loadFromJson(const String& jsonStr) {
     }
 
     // Parse device section
-    if (doc.containsKey("device")) {
+    if (doc["device"].is<JsonObject>()) {
         JsonObject device = doc["device"];
         config.device.id = device["id"] | config.device.id;
         config.device.name = device["name"] | config.device.name;
     }
 
     // Parse WiFi section
-    if (doc.containsKey("wifi")) {
+    if (doc["wifi"].is<JsonObject>()) {
         JsonObject wifi = doc["wifi"];
         config.wifi.ssid = wifi["ssid"] | config.wifi.ssid;
         config.wifi.password = wifi["password"] | config.wifi.password;
@@ -150,7 +160,7 @@ bool ConfigManager::loadFromJson(const String& jsonStr) {
     }
 
     // Parse server section
-    if (doc.containsKey("server")) {
+    if (doc["server"].is<JsonObject>()) {
         JsonObject server = doc["server"];
         config.server.host = server["host"] | config.server.host;
         config.server.port = server["port"] | config.server.port;
@@ -159,13 +169,13 @@ bool ConfigManager::loadFromJson(const String& jsonStr) {
     }
 
     // Parse display section
-    if (doc.containsKey("display")) {
+    if (doc["display"].is<JsonObject>()) {
         JsonObject display = doc["display"];
         config.display.width = display["width"] | config.display.width;
         config.display.height = display["height"] | config.display.height;
         config.display.rotation = display["rotation"] | config.display.rotation;
 
-        if (display.containsKey("pins")) {
+        if (display["pins"].is<JsonObject>()) {
             JsonObject pins = display["pins"];
             config.display.pins.cs = pins["cs"] | config.display.pins.cs;
             config.display.pins.dc = pins["dc"] | config.display.pins.dc;
@@ -177,7 +187,7 @@ bool ConfigManager::loadFromJson(const String& jsonStr) {
     }
 
     // Parse timing section
-    if (doc.containsKey("timing")) {
+    if (doc["timing"].is<JsonObject>()) {
         JsonObject timing = doc["timing"];
         config.timing.heartbeat_interval_ms = timing["heartbeat_interval_ms"] | config.timing.heartbeat_interval_ms;
         config.timing.heartbeat_timeout_ms = timing["heartbeat_timeout_ms"] | config.timing.heartbeat_timeout_ms;
@@ -186,14 +196,14 @@ bool ConfigManager::loadFromJson(const String& jsonStr) {
     }
 
     // Parse security section
-    if (doc.containsKey("security")) {
+    if (doc["security"].is<JsonObject>()) {
         JsonObject security = doc["security"];
         config.security.use_aes = security["use_aes"] | config.security.use_aes;
         config.security.aes_key = security["aes_key"] | config.security.aes_key;
     }
 
     // Parse power section
-    if (doc.containsKey("power")) {
+    if (doc["power"].is<JsonObject>()) {
         JsonObject power = doc["power"];
         config.power.sleep_enabled = power["sleep_enabled"] | config.power.sleep_enabled;
         config.power.sleep_duration_min = power["sleep_duration_min"] | config.power.sleep_duration_min;
@@ -202,10 +212,26 @@ bool ConfigManager::loadFromJson(const String& jsonStr) {
     }
 
     // Parse logging section
-    if (doc.containsKey("logging")) {
+    if (doc["logging"].is<JsonObject>()) {
         JsonObject logging = doc["logging"];
         config.logging.default_level = logging["default_level"] | config.logging.default_level;
         config.logging.enable_test_commands = logging["enable_test_commands"] | config.logging.enable_test_commands;
+    }
+
+    // Parse timezone section
+    if (doc["timezone"].is<JsonObject>()) {
+        JsonObject timezone = doc["timezone"];
+        config.timezone.sync_interval_hours = timezone["sync_interval_hours"] | config.timezone.sync_interval_hours;
+        config.timezone.api_url = timezone["api_url"] | config.timezone.api_url;
+        config.timezone.api_key = timezone["api_key"] | config.timezone.api_key;
+    }
+
+    // Parse quiet_hours section
+    if (doc["quiet_hours"].is<JsonObject>()) {
+        JsonObject quiet_hours = doc["quiet_hours"];
+        config.quiet_hours.start_hour = quiet_hours["start_hour"] | config.quiet_hours.start_hour;
+        config.quiet_hours.end_hour = quiet_hours["end_hour"] | config.quiet_hours.end_hour;
+        config.quiet_hours.sleep_multiplier = quiet_hours["sleep_multiplier"] | config.quiet_hours.sleep_multiplier;
     }
 
     loaded = true;
@@ -293,6 +319,18 @@ String ConfigManager::toJson() {
     JsonObject logging = doc["logging"].to<JsonObject>();
     logging["default_level"] = config.logging.default_level;
     logging["enable_test_commands"] = config.logging.enable_test_commands;
+
+    // Timezone section
+    JsonObject timezone = doc["timezone"].to<JsonObject>();
+    timezone["sync_interval_hours"] = config.timezone.sync_interval_hours;
+    timezone["api_url"] = config.timezone.api_url;
+    timezone["api_key"] = config.timezone.api_key;
+
+    // Quiet hours section
+    JsonObject quiet_hours = doc["quiet_hours"].to<JsonObject>();
+    quiet_hours["start_hour"] = config.quiet_hours.start_hour;
+    quiet_hours["end_hour"] = config.quiet_hours.end_hour;
+    quiet_hours["sleep_multiplier"] = config.quiet_hours.sleep_multiplier;
 
     String output;
     serializeJsonPretty(doc, output);
