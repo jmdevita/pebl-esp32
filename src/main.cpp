@@ -236,6 +236,21 @@ RTC_DATA_ATTR bool wokeOnBattery = false;
 RTC_DATA_ATTR unsigned long rtcBatteryModeStartTime = 0;
 RTC_DATA_ATTR bool rtcWasPreviouslyOnBattery = false;
 
+// WiFi adaptive power management state (survives deep sleep)
+RTC_DATA_ATTR struct {
+    wifi_power_t currentPower;       // Current TX power level
+    uint8_t consecutiveFailures;     // Consecutive failures at current level
+    uint8_t totalFailedWakes;        // Total failed wake cycles
+    bool wifiDisabledMode;           // True if in low-power fallback
+    uint8_t fallbackWakeCount;       // Wakes since entering fallback
+} wifiPowerState = {
+    WIFI_POWER_11dBm,  // Start at LOW for battery savings
+    0,
+    0,
+    false,
+    0
+};
+
 // ============================================================================
 // Display State Tracking
 // ============================================================================
@@ -1302,6 +1317,13 @@ bool isQuietHours() {
  */
 uint32_t calculateSleepDuration() {
     const AppConfig& cfg = ConfigManager::getConfig();
+
+    // Override: WiFi fallback mode uses 60-minute sleep
+    if (wifiPowerState.wifiDisabledMode) {
+        logMessage(LOG_INFO, "POWER", "WiFi fallback mode - using 60-minute sleep");
+        return 60;
+    }
+
     uint32_t baseSleepMin = cfg.power.sleep_duration_min;
 
     if (isQuietHours()) {
@@ -2031,6 +2053,28 @@ public:
             return startProvisioning();
         }
 
+        // Check WiFi fallback mode (low-power mode after repeated failures)
+        if (wifiPowerState.wifiDisabledMode) {
+            wifiPowerState.fallbackWakeCount++;
+
+            // Retry every 6 hours (6 wakes at 60-min sleep = 6 hours)
+            if (wifiPowerState.fallbackWakeCount >= 6) {
+                // Reset and retry
+                wifiPowerState.wifiDisabledMode = false;
+                wifiPowerState.fallbackWakeCount = 0;
+                wifiPowerState.currentPower = WIFI_POWER_11dBm;  // Reset to LOW
+                wifiPowerState.consecutiveFailures = 0;
+                wifiPowerState.totalFailedWakes = 0;
+                logMessage(LOG_INFO, "WIFI", "Exiting fallback mode - resetting to LOW power");
+            } else {
+                // Still in fallback - skip WiFi attempt
+                snprintf(logBuf, sizeof(logBuf), "wake_count=%d/6 next_retry_in=%dh",
+                         wifiPowerState.fallbackWakeCount, 6 - wifiPowerState.fallbackWakeCount);
+                logMessage(LOG_INFO, "WIFI", "In fallback mode - skipping WiFi", logBuf);
+                return false;
+            }
+        }
+
         // Try connecting 3 times before entering provisioning mode
         const int maxRetries = 3;
         const uint32_t retryDelay = 5000;  // 5 seconds between retries
@@ -2049,6 +2093,42 @@ public:
             }
 
             WiFi.mode(WIFI_STA);
+
+            // Apply TX power (priority: forced > adaptive > default)
+            wifi_power_t txPower = wifiPowerState.currentPower;
+            const char* powerName = "UNKNOWN";
+
+            if (!cfg.wifi.force_tx_power.isEmpty()) {
+                // User forced a specific power level (takes priority, works with or without adaptive)
+                if (cfg.wifi.force_tx_power == "LOW") {
+                    txPower = WIFI_POWER_11dBm;
+                    powerName = "LOW";
+                } else if (cfg.wifi.force_tx_power == "MEDIUM") {
+                    txPower = WIFI_POWER_15dBm;
+                    powerName = "MEDIUM";
+                } else if (cfg.wifi.force_tx_power == "HIGH") {
+                    txPower = WIFI_POWER_19_5dBm;
+                    powerName = "HIGH";
+                }
+            } else if (cfg.wifi.adaptive_tx_power) {
+                // Use adaptive power from RTC memory
+                if (txPower == WIFI_POWER_11dBm) {
+                    powerName = "LOW";
+                } else if (txPower == WIFI_POWER_15dBm) {
+                    powerName = "MEDIUM";
+                } else {
+                    powerName = "HIGH";
+                }
+            } else {
+                // Adaptive disabled and no force - use default HIGH
+                txPower = WIFI_POWER_19_5dBm;
+                powerName = "HIGH";
+            }
+
+            WiFi.setTxPower(txPower);
+            snprintf(logBuf, sizeof(logBuf), "tx_power=%s", powerName);
+            logMessage(LOG_DEBUG, "WIFI", "Setting TX power", logBuf);
+
             WiFi.begin(cfg.wifi.ssid.c_str(), cfg.wifi.password.c_str());
 
             const uint32_t startTime = millis();
@@ -2063,9 +2143,17 @@ public:
 
             // Check if connected
             if (WiFi.status() == WL_CONNECTED) {
-                snprintf(logBuf, sizeof(logBuf), "ip=%s rssi=%d",
-                         WiFi.localIP().toString().c_str(), WiFi.RSSI());
+                int rssi = WiFi.RSSI();
+                snprintf(logBuf, sizeof(logBuf), "ip=%s rssi=%d tx_power=%s",
+                         WiFi.localIP().toString().c_str(), rssi, powerName);
                 logMessage(LOG_INFO, "WIFI", "Connected", logBuf);
+
+                // Reset adaptive power failures on successful connection
+                if (cfg.wifi.adaptive_tx_power) {
+                    wifiPowerState.consecutiveFailures = 0;
+                    wifiPowerState.totalFailedWakes = 0;
+                    // Keep current power level (sticky behavior)
+                }
 
                 // Give DNS servers time to be ready (prevents early OTA check failures)
                 delay(2000);
@@ -2080,7 +2168,41 @@ public:
                 return true;
             }
 
-            // Failed attempt - wait before retry (unless it's the last attempt)
+            // Failed attempt - handle adaptive power escalation
+            if (cfg.wifi.adaptive_tx_power && cfg.wifi.force_tx_power.isEmpty()) {
+                wifiPowerState.consecutiveFailures++;
+                wifiPowerState.totalFailedWakes++;
+
+                // Check for power escalation
+                if (wifiPowerState.consecutiveFailures >= cfg.wifi.escalation_threshold) {
+                    if (wifiPowerState.currentPower == WIFI_POWER_11dBm) {
+                        // Escalate LOW → MEDIUM
+                        wifiPowerState.currentPower = WIFI_POWER_15dBm;
+                        wifiPowerState.consecutiveFailures = 0;
+                        logMessage(LOG_WARN, "WIFI", "Connection failed 3 times at LOW, escalating to MEDIUM power");
+                    } else if (wifiPowerState.currentPower == WIFI_POWER_15dBm) {
+                        // Escalate MEDIUM → HIGH
+                        wifiPowerState.currentPower = WIFI_POWER_19_5dBm;
+                        wifiPowerState.consecutiveFailures = 0;
+                        logMessage(LOG_WARN, "WIFI", "Connection failed 3 times at MEDIUM, escalating to HIGH power");
+                    } else {
+                        // Already at HIGH - can't escalate further
+                        logMessage(LOG_ERROR, "WIFI", "Connection failed at HIGH power - not a TX power issue");
+                    }
+                }
+
+                // Check for fallback mode entry
+                if (wifiPowerState.totalFailedWakes >= cfg.wifi.max_failed_wakes) {
+                    wifiPowerState.wifiDisabledMode = true;
+                    wifiPowerState.fallbackWakeCount = 0;
+                    snprintf(logBuf, sizeof(logBuf), "total_failures=%d threshold=%d",
+                             wifiPowerState.totalFailedWakes, cfg.wifi.max_failed_wakes);
+                    logMessage(LOG_ERROR, "WIFI", "Entering low-power fallback mode (60min sleep, retry in 6h)", logBuf);
+                    return false;  // Don't continue retrying in this wake cycle
+                }
+            }
+
+            // Wait before retry (unless it's the last attempt)
             if (attempt < maxRetries) {
                 snprintf(logBuf, sizeof(logBuf), "retry_in=%dms", retryDelay);
                 logMessage(LOG_WARN, "WIFI", "Retrying", logBuf);

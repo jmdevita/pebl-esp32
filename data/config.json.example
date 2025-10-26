@@ -7,7 +7,12 @@
     "ssid": "YOUR_WIFI_SSID",
     "password": "YOUR_WIFI_PASSWORD",
     "timeout_ms": 20000,
-    "reconnect_interval_ms": 30000
+    "reconnect_interval_ms": 30000,
+    "adaptive_tx_power": true,
+    "force_tx_power": "",
+    "escalation_threshold": 3,
+    "max_failed_wakes": 20,
+    "_comment": "Adaptive TX power: Starts at LOW (11dBm) for ~40% WiFi battery savings. Auto-escalates to MEDIUM/HIGH if connection fails. Use force_tx_power to override (LOW/MEDIUM/HIGH). After 20 failed wakes, enters low-power fallback mode (60min sleep, retries every 6h). RSSI guide: >-60dBm=Excellent (use LOW), -60 to -70=Good (MEDIUM), <-70=Fair (HIGH)."
   },
   "server": {
     "host": "YOUR_SERVER_URL",

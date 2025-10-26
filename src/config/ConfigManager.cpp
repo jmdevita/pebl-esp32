@@ -28,6 +28,11 @@ void ConfigManager::setDefaults() {
     config.wifi.password = "";
     config.wifi.timeout_ms = 15000;
     config.wifi.reconnect_interval_ms = 30000;
+    // Adaptive TX power defaults
+    config.wifi.adaptive_tx_power = true;
+    config.wifi.force_tx_power = "";
+    config.wifi.escalation_threshold = 3;
+    config.wifi.max_failed_wakes = 20;
 
     // Server defaults
     config.server.host = "slack-reactions.devita.dev";
@@ -160,6 +165,11 @@ bool ConfigManager::loadFromJson(const String& jsonStr) {
         config.wifi.password = wifi["password"] | config.wifi.password;
         config.wifi.timeout_ms = wifi["timeout_ms"] | config.wifi.timeout_ms;
         config.wifi.reconnect_interval_ms = wifi["reconnect_interval_ms"] | config.wifi.reconnect_interval_ms;
+        // Adaptive TX power settings
+        config.wifi.adaptive_tx_power = wifi["adaptive_tx_power"] | config.wifi.adaptive_tx_power;
+        config.wifi.force_tx_power = wifi["force_tx_power"] | config.wifi.force_tx_power;
+        config.wifi.escalation_threshold = wifi["escalation_threshold"] | config.wifi.escalation_threshold;
+        config.wifi.max_failed_wakes = wifi["max_failed_wakes"] | config.wifi.max_failed_wakes;
     }
 
     // Parse server section
@@ -290,6 +300,10 @@ String ConfigManager::toJson() {
     wifi["password"] = config.wifi.password;
     wifi["timeout_ms"] = config.wifi.timeout_ms;
     wifi["reconnect_interval_ms"] = config.wifi.reconnect_interval_ms;
+    wifi["adaptive_tx_power"] = config.wifi.adaptive_tx_power;
+    wifi["force_tx_power"] = config.wifi.force_tx_power;
+    wifi["escalation_threshold"] = config.wifi.escalation_threshold;
+    wifi["max_failed_wakes"] = config.wifi.max_failed_wakes;
 
     // Server section
     JsonObject server = doc["server"].to<JsonObject>();

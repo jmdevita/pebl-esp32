@@ -19,6 +19,11 @@ struct AppConfig {
         String password;
         uint32_t timeout_ms;
         uint32_t reconnect_interval_ms;
+        // Adaptive TX power settings
+        bool adaptive_tx_power;          // Enable/disable adaptive power management
+        String force_tx_power;           // Override: "LOW", "MEDIUM", "HIGH", or empty
+        uint8_t escalation_threshold;    // Failures before escalating power (default: 3)
+        uint8_t max_failed_wakes;        // Failed wakes before fallback mode (default: 20)
     } wifi;
 
     // Server settings
