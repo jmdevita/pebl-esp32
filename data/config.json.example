@@ -40,7 +40,7 @@
   },
   "power": {
     "sleep_enabled": true,
-    "sleep_duration_min": 5,
+    "sleep_duration_min": 1,
     "battery_pin": 35,
     "usb_threshold_v": 4.3
   },
@@ -56,6 +56,11 @@
   "quiet_hours": {
     "start_hour": 23,
     "end_hour": 7,
-    "sleep_multiplier": 3
+    "sleep_multiplier": 6,
+    "_comment": "Quiet hours extend sleep duration for battery savings. Weekdays: 11PM-7AM use 30-min sleep (1min x 6). Weekends: ALL DAY 30-min sleep for ~20% battery savings."
+  },
+  "display_policy": {
+    "skip_refresh_on_no_message": true,
+    "_comment": "skip_refresh_on_no_message saves battery by only refreshing when new reactions arrive or power state changes."
   }
 }

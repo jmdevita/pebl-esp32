@@ -49,7 +49,7 @@ void ConfigManager::setDefaults() {
     // Timing defaults
     config.timing.heartbeat_interval_ms = 15000;
     config.timing.heartbeat_timeout_ms = 30000;
-    config.timing.ws_initial_reconnect_ms = 5000;
+    config.timing.ws_initial_reconnect_ms = 15000;
     config.timing.ws_max_reconnect_ms = 60000;
 
     // Security defaults
@@ -58,13 +58,13 @@ void ConfigManager::setDefaults() {
 
     // Power defaults
     config.power.sleep_enabled = true;
-    config.power.sleep_duration_min = 5;
-    config.power.battery_pin = 36;
-    config.power.usb_threshold_v = 4.0;  // Lowered from 4.2 to handle typical charging voltages (4.0-4.15V)
+    config.power.sleep_duration_min = 1;
+    config.power.battery_pin = 35;
+    config.power.usb_threshold_v = 4.3;
 
     // Logging defaults
     config.logging.default_level = "WARN";
-    config.logging.enable_test_commands = true;
+    config.logging.enable_test_commands = false;
 
     // Timezone defaults
     config.timezone.sync_interval_hours = 24;
@@ -74,7 +74,10 @@ void ConfigManager::setDefaults() {
     // Quiet hours defaults
     config.quiet_hours.start_hour = 23;  // 11 PM
     config.quiet_hours.end_hour = 7;     // 7 AM
-    config.quiet_hours.sleep_multiplier = 3;  // 3x sleep duration during quiet hours
+    config.quiet_hours.sleep_multiplier = 6;  // 6x sleep duration during quiet hours (30 min)
+
+    // Display policy defaults
+    config.display_policy.skip_refresh_on_no_message = true;   // Save battery by only refreshing on new reactions
 }
 
 bool ConfigManager::begin() {
@@ -234,6 +237,12 @@ bool ConfigManager::loadFromJson(const String& jsonStr) {
         config.quiet_hours.sleep_multiplier = quiet_hours["sleep_multiplier"] | config.quiet_hours.sleep_multiplier;
     }
 
+    // Parse display_policy section
+    if (doc["display_policy"].is<JsonObject>()) {
+        JsonObject display_policy = doc["display_policy"];
+        config.display_policy.skip_refresh_on_no_message = display_policy["skip_refresh_on_no_message"] | config.display_policy.skip_refresh_on_no_message;
+    }
+
     loaded = true;
     logMessage("INFO", "CONFIG", "Configuration loaded successfully");
     
@@ -331,6 +340,10 @@ String ConfigManager::toJson() {
     quiet_hours["start_hour"] = config.quiet_hours.start_hour;
     quiet_hours["end_hour"] = config.quiet_hours.end_hour;
     quiet_hours["sleep_multiplier"] = config.quiet_hours.sleep_multiplier;
+
+    // Display policy section
+    JsonObject display_policy = doc["display_policy"].to<JsonObject>();
+    display_policy["skip_refresh_on_no_message"] = config.display_policy.skip_refresh_on_no_message;
 
     String output;
     serializeJsonPretty(doc, output);

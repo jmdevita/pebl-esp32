@@ -85,6 +85,11 @@ struct AppConfig {
         uint8_t end_hour;             // End of quiet hours (0-23, default: 7)
         uint8_t sleep_multiplier;     // Sleep multiplier during quiet hours (default: 3)
     } quiet_hours;
+
+    // Display update policy settings
+    struct {
+        bool skip_refresh_on_no_message;  // Skip full refresh on wake if no new reaction (default: true)
+    } display_policy;
 };
 
 class ConfigManager {

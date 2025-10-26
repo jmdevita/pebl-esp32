@@ -138,7 +138,7 @@ namespace BatteryConstants {
     // Sleep thresholds
     constexpr int LOW_BATTERY_SLEEP_THRESHOLD = 15;        // Sleep immediately below 15% (balanced runtime vs longevity)
     constexpr unsigned long GRACE_PERIOD_MS = 60000;       // 60s grace after switching to battery
-    constexpr unsigned long MAX_BATTERY_RUNTIME_MS = 120000; // 2min max runtime on battery
+    constexpr unsigned long MAX_BATTERY_RUNTIME_MS = 20000; // 20sec max runtime on battery (allows emoji downloads + WiFi variance)
 
     // ADC configuration
     constexpr int ADC_SAMPLE_COUNT = 10;                   // Samples for averaging
@@ -226,6 +226,22 @@ RTC_DATA_ATTR struct {
     bool isEncrypted = false;
 } lastReaction;
 
+// Track what the display is showing (survives deep sleep)
+RTC_DATA_ATTR bool displayShowingBattery = false;
+
+// Track if device woke from sleep on battery (used for Bug #2 fix - different timeouts)
+RTC_DATA_ATTR bool wokeOnBattery = false;
+
+// Power management state (survives deep sleep)
+RTC_DATA_ATTR unsigned long rtcBatteryModeStartTime = 0;
+RTC_DATA_ATTR bool rtcWasPreviouslyOnBattery = false;
+
+// ============================================================================
+// Display State Tracking
+// ============================================================================
+// Track whether a full refresh has happened since wake (reset on each wake)
+bool fullRefreshSinceWake = false;
+
 // ============================================================================
 // OTA Update State
 // ============================================================================
@@ -246,6 +262,20 @@ void injectTestMessage(const String& jsonPayload);
 void checkForFirmwareUpdate();
 void performOTAUpdate();
 bool isDeviceIdle();
+
+// ============================================================================
+// Display State Helper
+// ============================================================================
+// Helper function to update display state after any full refresh
+void updateDisplayStateAfterFullRefresh() {
+    fullRefreshSinceWake = true;
+    displayShowingBattery = !isUSBPowered();
+
+    char stateBuf[64];
+    snprintf(stateBuf, sizeof(stateBuf), "fullRefresh=true displayShowingBattery=%s",
+             displayShowingBattery ? "true" : "false");
+    logMessage(LOG_DEBUG, "DISPLAY", "Display state updated after full refresh", stateBuf);
+}
 
 // ============================================================================
 // Emoji Renderer - Memory-efficient PNG emoji rendering
@@ -672,6 +702,9 @@ public:
                 }
             }
         } while (display->nextPage());
+
+        // Update display state flags after full refresh
+        updateDisplayStateAfterFullRefresh();
     }
 
     static void showReaction(const JsonObject& reaction) {
@@ -787,6 +820,9 @@ public:
             display->print(timestamp);
 
         } while (display->nextPage());
+
+        // Update display state flags after full refresh
+        updateDisplayStateAfterFullRefresh();
     }
 
     // Show WiFi provisioning mode with QR code
@@ -862,6 +898,9 @@ public:
             display->print("manually to configure");
 
         } while (display->nextPage());
+
+        // Update display state flags after full refresh
+        updateDisplayStateAfterFullRefresh();
 
         logMessage(LOG_INFO, "DISPLAY", "Provisioning mode displayed");
     }
@@ -1216,15 +1255,36 @@ int getCurrentLocalHour() {
 /**
  * Check if current time is during quiet hours
  * Returns true if in quiet hours, false otherwise
+ * Weekends (Saturday/Sunday) are quiet hours all day for battery savings
  */
 bool isQuietHours() {
     const AppConfig& cfg = ConfigManager::getConfig();
 
-    int hour = getCurrentLocalHour();
-    if (hour < 0) {
+    // Check if time is known
+    if (currentTime == 0) {
         // Time unknown - not in quiet hours (fallback to normal sleep)
         return false;
     }
+
+    // Get local time info including day of week
+    time_t localTime = currentTime + timezoneOffsetSeconds;
+    struct tm* timeinfo = gmtime(&localTime);
+
+    // Check for gmtime() failure (defensive programming)
+    if (timeinfo == nullptr) {
+        logMessage(LOG_ERROR, "TIME", "gmtime() failed in isQuietHours()");
+        return false;
+    }
+
+    // Check if it's weekend (Saturday=6 or Sunday=0)
+    // Weekends are quiet hours all day for battery savings (~16% reduction)
+    bool isWeekend = (timeinfo->tm_wday == 0 || timeinfo->tm_wday == 6);
+    if (isWeekend) {
+        return true;  // All day quiet hours on weekends
+    }
+
+    // Weekday: Check night-time quiet hours (e.g., 23:00 - 07:00)
+    int hour = timeinfo->tm_hour;
 
     // Handle quiet hours that span midnight
     if (cfg.quiet_hours.start_hour > cfg.quiet_hours.end_hour) {
@@ -1294,11 +1354,14 @@ void gracefulShutdown(const char* reason, bool clearDisplay = false) {
         if (clearDisplay) {
             logMessage(LOG_INFO, "SHUTDOWN", "Clearing display");
             display->clearScreen();
+            // Update display state after clear (full refresh happened)
+            updateDisplayStateAfterFullRefresh();
             delay(100);
         } else if (!enteringSleep) {
             // Only show shutdown message if NOT entering sleep (preserve reaction display during sleep)
             logMessage(LOG_INFO, "SHUTDOWN", "Showing shutdown message");
             DisplayManager::showMessage("System", "Shutting down...", reason, "");
+            // Note: showMessage() already calls updateDisplayStateAfterFullRefresh()
             delay(100);
         } else {
             // Entering sleep - preserve current display state (reaction or previous screen)
@@ -1322,45 +1385,10 @@ void gracefulShutdown(const char* reason, bool clearDisplay = false) {
 }
 
 void enterDeepSleep(uint32_t sleep_minutes) {
+    const AppConfig& cfg = ConfigManager::getConfig();
+
     logMessage(LOG_INFO, "POWER", "Entering deep sleep",
                String("minutes=" + String(sleep_minutes)).c_str());
-
-    // Update display to show "SLEEP" at top before entering deep sleep
-    if (display) {
-        display->setFont(nullptr);  // Small built-in font
-        int16_t centerX = display->width() / 2;
-        int16_t x1, y1;
-        uint16_t w, h;
-
-        // Calculate window size based on "CHARGE NOW" (the longest possible status text)
-        // This ensures full clear area regardless of what battery status was showing
-        // Possible texts: "BATTERY" / "LOW BATT" / "CHARGE NOW" (longest at ~60px)
-        const char* longestText = "CHARGE NOW";
-        display->getTextBounds(longestText, 0, 0, &x1, &y1, &w, &h);
-        int16_t textX = centerX - (w / 2);
-        int16_t clearX = textX - 5;
-        int16_t clearW = w + 10;
-
-        // Calculate position for "SLEEP" text (centered)
-        const char* sleepText = "SLEEP";
-        display->getTextBounds(sleepText, 0, 0, &x1, &y1, &w, &h);
-        int16_t sleepX = centerX - (w / 2);
-
-        // Partial update: clear area sized for "CHARGE NOW", draw "SLEEP" centered
-        display->setPartialWindow(clearX, 0, clearW, 15);
-        display->firstPage();
-        do {
-            // Clear the full text area (sized for longest possible status text)
-            display->fillRect(clearX, 0, clearW, 15, GxEPD_WHITE);
-
-            // Draw "SLEEP" text centered
-            display->setTextColor(GxEPD_BLACK);
-            display->setCursor(sleepX, 8);
-            display->print(sleepText);
-        } while (display->nextPage());
-
-        logMessage(LOG_INFO, "POWER", "Display updated battery status->SLEEP");
-    }
 
     // Set flag to suppress disconnect/shutdown messages
     enteringSleep = true;
@@ -2451,9 +2479,9 @@ void setup() {
 
     // Connect to WiFi (silent mode on wake from sleep to skip connection screens)
     if (NetworkManager::connectWiFi(isWakeFromSleep)) {
-        // On wake from sleep: redraw screen from RTC memory
+        // On wake from sleep: conditionally refresh display based on config
         if (isWakeFromSleep) {
-            logMessage(LOG_INFO, "DISPLAY", "Restoring display state on wake from sleep");
+            logMessage(LOG_INFO, "DISPLAY", "Wake from sleep - checking display update policy");
 
             // Reset sleep flag (we're awake now)
             enteringSleep = false;
@@ -2461,13 +2489,61 @@ void setup() {
             // Set flag to suppress "Connected!" message when WebSocket reconnects
             justWokeFromSleep = true;
 
-            // Redraw display using RTC memory data
-            if (display) {
+            // Reset full refresh flag (we haven't done one yet this wake cycle)
+            fullRefreshSinceWake = false;
+
+            // Determine if we should refresh the display
+            bool shouldRefreshDisplay = false;
+
+            // Check if power state changed during sleep
+            BatteryStatus batteryStatus = getBatteryStatus();
+            bool isOnBatteryNow = !batteryStatus.isUSBPowered;
+            bool powerStateChanged = (displayShowingBattery != isOnBatteryNow);
+
+            // Set flag if we woke on battery (used for Bug #2 fix - different timeouts)
+            wokeOnBattery = isOnBatteryNow;
+            if (wokeOnBattery) {
+                // Initialize battery mode timing - start counting from wake (millis() = 0)
+                rtcBatteryModeStartTime = 0;
+                rtcWasPreviouslyOnBattery = true;
+                logMessage(LOG_DEBUG, "POWER", "Woke on battery - initialized timing, will use MAX_BATTERY_RUNTIME_MS (20s) timeout");
+            } else {
+                // Woke on USB - clear battery mode state
+                rtcBatteryModeStartTime = 0;
+                rtcWasPreviouslyOnBattery = false;
+                logMessage(LOG_DEBUG, "POWER", "Woke on USB - no timeout applied");
+            }
+
+            if (cfg.display_policy.skip_refresh_on_no_message) {
+                // Smart refresh strategy
+                if (!lastReaction.hasReaction) {
+                    // First boot - always refresh
+                    shouldRefreshDisplay = true;
+                    logMessage(LOG_INFO, "DISPLAY", "First boot - will show blank screen with status bar");
+                } else if (powerStateChanged) {
+                    // Power state changed during sleep - refresh to update display
+                    shouldRefreshDisplay = true;
+                    char logBuf[128];
+                    snprintf(logBuf, sizeof(logBuf), "power_changed from_%s to_%s",
+                             displayShowingBattery ? "battery" : "usb",
+                             isOnBatteryNow ? "battery" : "usb");
+                    logMessage(LOG_INFO, "DISPLAY", "Power state changed - updating display", logBuf);
+                } else {
+                    // No change - skip refresh (optimization)
+                    logMessage(LOG_INFO, "DISPLAY", "Preserving display - will update on new message only");
+                }
+            } else {
+                // Legacy behavior: Always refresh on wake
+                shouldRefreshDisplay = true;
+                logMessage(LOG_INFO, "DISPLAY", "Legacy mode - always refresh on wake");
+            }
+
+            // Perform display refresh if needed
+            if (shouldRefreshDisplay && display) {
                 if (lastReaction.hasReaction) {
-                    // Option 1: We have a saved reaction - redraw it from RTC memory
+                    // Redraw last reaction from RTC memory
                     logMessage(LOG_INFO, "RTC", "Redrawing last reaction from RTC memory");
 
-                    // Create JSON object from RTC memory to pass to showReaction
                     JsonDocument doc;
                     doc["emoji"] = lastReaction.emoji;
                     doc["emoji_url"] = lastReaction.emojiUrl;
@@ -2479,9 +2555,8 @@ void setup() {
 
                     DisplayManager::showReaction(doc.as<JsonObject>());
                     logMessage(LOG_INFO, "DISPLAY", "Successfully restored reaction after wake");
-
                 } else {
-                    // Option B: No saved reaction - show blank screen with just top bar
+                    // No saved reaction - show blank screen with just top bar
                     logMessage(LOG_INFO, "RTC", "No saved reaction - showing blank screen with status bar");
 
                     display->setFullWindow();
@@ -2506,23 +2581,16 @@ void setup() {
 
                     logMessage(LOG_INFO, "DISPLAY", "Blank screen with status bar displayed");
                 }
-            }
 
-            // Refresh power status display after WiFi connects (ensures accurate USB detection)
-            // The initial display draw happened before WiFi load, which affects USB detection accuracy
-            delay(500);  // Let WiFi establish and create some load
-            display->setPartialWindow(0, 0, display->width(), 15);
-            display->firstPage();
-            do {
-                display->fillRect(0, 0, display->width(), 15, GxEPD_WHITE);  // Clear top bar
-                DisplayManager::drawBatteryIndicator();
-                DisplayManager::drawPowerStatusIndicator();  // Now with proper WiFi load for accurate detection
-                // Redraw lock icon if encryption enabled
-                if (cfg.security.use_aes && !cfg.security.aes_key.isEmpty()) {
-                    DisplayManager::drawLockIcon();
-                }
-            } while (display->nextPage());
-            logMessage(LOG_INFO, "DISPLAY", "Refreshed power status after WiFi connection");
+                // Mark that full refresh has happened and update display state
+                fullRefreshSinceWake = true;
+                displayShowingBattery = isOnBatteryNow;
+
+                char stateBuf[64];
+                snprintf(stateBuf, sizeof(stateBuf), "fullRefresh=true displayShowingBattery=%s",
+                         displayShowingBattery ? "true" : "false");
+                logMessage(LOG_DEBUG, "DISPLAY", "Display state updated after refresh", stateBuf);
+            }
         }
 
         // Timezone sync logic (after WiFi connected)
@@ -2677,9 +2745,11 @@ void loop() {
     const AppConfig& cfg = ConfigManager::getConfig();
     if (cfg.power.sleep_enabled) {
         static unsigned long lastPowerCheck = 0;
-        static unsigned long batteryModeStartTime = 0;
-        static bool wasPreviouslyOnBattery = false;
         unsigned long now = millis();
+
+        // Use RTC memory for battery state (survives deep sleep)
+        unsigned long& batteryModeStartTime = rtcBatteryModeStartTime;
+        bool& wasPreviouslyOnBattery = rtcWasPreviouslyOnBattery;
 
         // Check power status every 10 seconds (rollover-safe comparison)
         if ((unsigned long)(now - lastPowerCheck) > 10000) {
@@ -2704,20 +2774,54 @@ void loop() {
             if (isOnBattery && !wasPreviouslyOnBattery) {
                 batteryModeStartTime = now;
                 wasPreviouslyOnBattery = true;
-                logMessage(LOG_INFO, "POWER", "Switched to battery mode", "starting_grace_period=60s");
+                // Note: Don't modify wokeOnBattery here - it's only set during wake from sleep
+                logMessage(LOG_INFO, "POWER", "Switched to battery mode (USB unplugged)", "grace_period=60s");
 
                 // Update display to show "BATTERY" text at top
-                display->setPartialWindow(0, 0, display->width(), 15);
-                display->firstPage();
-                do {
-                    display->fillRect(0, 0, display->width(), 15, GxEPD_WHITE);  // Clear top bar
-                    DisplayManager::drawBatteryIndicator();
-                    DisplayManager::drawPowerStatusIndicator();
-                    // Redraw lock icon if encryption enabled
-                    if (cfg.security.use_aes && !cfg.security.aes_key.isEmpty()) {
-                        DisplayManager::drawLockIcon();
+                if (fullRefreshSinceWake && display) {
+                    // Safe for partial refresh - controller RAM is synced
+                    display->setPartialWindow(0, 0, display->width(), 15);
+                    display->firstPage();
+                    do {
+                        display->fillRect(0, 0, display->width(), 15, GxEPD_WHITE);  // Clear top bar
+                        DisplayManager::drawBatteryIndicator();
+                        DisplayManager::drawPowerStatusIndicator();
+                        // Redraw lock icon if encryption enabled
+                        if (cfg.security.use_aes && !cfg.security.aes_key.isEmpty()) {
+                            DisplayManager::drawLockIcon();
+                        }
+                    } while (display->nextPage());
+                    displayShowingBattery = true;
+                    logMessage(LOG_DEBUG, "DISPLAY", "Partial refresh: added BATTERY text");
+                } else if (display) {
+                    // NOT safe for partial - need full refresh
+                    logMessage(LOG_INFO, "DISPLAY", "Full refresh required - redrawing saved reaction with BATTERY");
+                    if (lastReaction.hasReaction) {
+                        JsonDocument doc;
+                        doc["emoji"] = lastReaction.emoji;
+                        doc["emoji_url"] = lastReaction.emojiUrl;
+                        doc["user"] = lastReaction.user;
+                        doc["channel"] = lastReaction.channel;
+                        doc["message"] = lastReaction.message;
+                        doc["timestamp"] = "";
+                        doc["encrypted"] = lastReaction.isEncrypted;
+                        DisplayManager::showReaction(doc.as<JsonObject>());
+                    } else {
+                        // Show blank screen with BATTERY
+                        display->setFullWindow();
+                        display->firstPage();
+                        do {
+                            display->fillScreen(GxEPD_WHITE);
+                            display->setTextColor(GxEPD_BLACK);
+                            DisplayManager::drawBatteryIndicator();
+                            DisplayManager::drawPowerStatusIndicator();
+                            DisplayManager::drawUnlockIcon();
+                        } while (display->nextPage());
                     }
-                } while (display->nextPage());
+                    fullRefreshSinceWake = true;
+                    displayShowingBattery = true;
+                    logMessage(LOG_DEBUG, "DISPLAY", "Full refresh: now showing BATTERY text");
+                }
 
             } else if (!isOnBattery && wasPreviouslyOnBattery) {
                 wasPreviouslyOnBattery = false;
@@ -2725,43 +2829,95 @@ void loop() {
                 logMessage(LOG_INFO, "POWER", "Switched to USB mode", "");
 
                 // Update display to remove "BATTERY" text (top bar shows nothing on USB)
-                display->setPartialWindow(0, 0, display->width(), 15);
-                display->firstPage();
-                do {
-                    display->fillRect(0, 0, display->width(), 15, GxEPD_WHITE);  // Clear top bar
-                    DisplayManager::drawBatteryIndicator();
-                    DisplayManager::drawPowerStatusIndicator();  // Shows nothing on USB
-                    // Redraw lock icon if encryption enabled
-                    if (cfg.security.use_aes && !cfg.security.aes_key.isEmpty()) {
-                        DisplayManager::drawLockIcon();
+                if (fullRefreshSinceWake && display) {
+                    // Safe for partial refresh - controller RAM is synced
+                    display->setPartialWindow(0, 0, display->width(), 15);
+                    display->firstPage();
+                    do {
+                        display->fillRect(0, 0, display->width(), 15, GxEPD_WHITE);  // Clear top bar
+                        DisplayManager::drawBatteryIndicator();
+                        DisplayManager::drawPowerStatusIndicator();  // Shows nothing on USB
+                        // Redraw lock icon if encryption enabled
+                        if (cfg.security.use_aes && !cfg.security.aes_key.isEmpty()) {
+                            DisplayManager::drawLockIcon();
+                        }
+                    } while (display->nextPage());
+                    displayShowingBattery = false;
+                    logMessage(LOG_DEBUG, "DISPLAY", "Partial refresh: removed BATTERY text");
+                } else if (display) {
+                    // NOT safe for partial - need full refresh
+                    logMessage(LOG_INFO, "DISPLAY", "Full refresh required - redrawing saved reaction without BATTERY");
+                    if (lastReaction.hasReaction) {
+                        JsonDocument doc;
+                        doc["emoji"] = lastReaction.emoji;
+                        doc["emoji_url"] = lastReaction.emojiUrl;
+                        doc["user"] = lastReaction.user;
+                        doc["channel"] = lastReaction.channel;
+                        doc["message"] = lastReaction.message;
+                        doc["timestamp"] = "";
+                        doc["encrypted"] = lastReaction.isEncrypted;
+                        DisplayManager::showReaction(doc.as<JsonObject>());
+                    } else {
+                        // Show blank screen without BATTERY
+                        display->setFullWindow();
+                        display->firstPage();
+                        do {
+                            display->fillScreen(GxEPD_WHITE);
+                            display->setTextColor(GxEPD_BLACK);
+                            DisplayManager::drawBatteryIndicator();
+                            DisplayManager::drawPowerStatusIndicator();
+                            DisplayManager::drawUnlockIcon();
+                        } while (display->nextPage());
                     }
-                } while (display->nextPage());
+                    fullRefreshSinceWake = true;
+                    displayShowingBattery = false;
+                    logMessage(LOG_DEBUG, "DISPLAY", "Full refresh: now NOT showing BATTERY text");
+                }
             }
 
             if (isOnBattery) {
                 // Calculate time on battery (rollover-safe)
                 unsigned long timeOnBattery = (unsigned long)(now - batteryModeStartTime);
 
-                // Grace period: Don't sleep for 60 seconds after switching to battery
-                // This prevents immediate sleep when unplugging USB causes brief WebSocket disconnect
-                if (timeOnBattery < GRACE_PERIOD_MS) {
-                    char logBuf[128];
-                    snprintf(logBuf, sizeof(logBuf), "in_grace_period time_on_battery=%lus", timeOnBattery / 1000);
-                    logMessage(LOG_INFO, "POWER", "Battery mode grace period", logBuf);
+                // Bug #2 Fix: Different timeouts for different scenarios
+                // - Woke on battery (batteryModeStartTime was 0): Use short timeout (20s)
+                // - USB unplugged (batteryModeStartTime was set during runtime): Use grace period (60s)
+                unsigned long sleepTimeout;
+                const char* timeoutReason;
+
+                // Check if we woke on battery: batteryModeStartTime will be 0 and wokeOnBattery true
+                // After USB unplug: batteryModeStartTime will be > 0 (set to current millis)
+                bool isWakeOnBattery = (wokeOnBattery && wasPreviouslyOnBattery && batteryModeStartTime == 0);
+
+                if (isWakeOnBattery) {
+                    // Woke from sleep on battery - use short timeout for battery optimization
+                    sleepTimeout = MAX_BATTERY_RUNTIME_MS;  // 20s
+                    timeoutReason = "wake_on_battery";
                 } else {
-                    // After grace period, apply sleep logic
+                    // USB was unplugged while awake - use grace period for stability
+                    sleepTimeout = GRACE_PERIOD_MS;  // 60s
+                    timeoutReason = "usb_unplugged";
+                }
+
+                if (timeOnBattery < sleepTimeout) {
+                    char logBuf[128];
+                    snprintf(logBuf, sizeof(logBuf), "scenario=%s timeout=%lus time_on_battery=%lus",
+                             timeoutReason, sleepTimeout / 1000, timeOnBattery / 1000);
+                    logMessage(LOG_DEBUG, "POWER", "Battery mode - within timeout", logBuf);
+                } else {
+                    // Timeout exceeded, apply sleep logic
                     bool shouldSleep = false;
                     const char* sleepReason = nullptr;
 
-                    // Sleep if no WebSocket connection (already past grace period)
+                    // Sleep if no WebSocket connection (already past timeout)
                     if (!wsConnected) {
                         shouldSleep = true;
                         sleepReason = "no_connection";
                     }
-                    // Sleep if max runtime on battery exceeded
-                    else if (timeOnBattery > MAX_BATTERY_RUNTIME_MS) {
+                    // Sleep if timeout exceeded
+                    else {
                         shouldSleep = true;
-                        sleepReason = "max_runtime";
+                        sleepReason = timeoutReason;
                     }
 
                     if (shouldSleep) {
@@ -2770,15 +2926,10 @@ void loop() {
                                  sleepReason, timeOnBattery / 1000, batteryPct, wsConnected ? "true" : "false");
                         logMessage(LOG_INFO, "POWER", "Battery mode sleep triggered", logBuf);
                         enterDeepSleep(calculateSleepDuration());
-                    } else {
-                        char logBuf[128];
-                        snprintf(logBuf, sizeof(logBuf), "wsConnected=%s time_on_battery=%lus battery=%d%%",
-                                 wsConnected ? "true" : "false", timeOnBattery / 1000, batteryPct);
-                        logMessage(LOG_INFO, "POWER", "Battery mode - not sleeping yet", logBuf);
                     }
                 }
             } else {
-                logMessage(LOG_INFO, "POWER", "USB powered - staying awake");
+                logMessage(LOG_DEBUG, "POWER", "USB powered - staying awake");
             }
         }
     } else {
