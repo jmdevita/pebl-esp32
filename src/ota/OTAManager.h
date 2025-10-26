@@ -113,13 +113,6 @@ private:
     HTTPClient httpClient;
     WiFiClientSecure secureClient;
 
-    // Security constants (override in production with actual certificate)
-    static constexpr const char* SERVER_ROOT_CA = R"(
------BEGIN CERTIFICATE-----
-[Your server's root CA certificate - replace in production]
------END CERTIFICATE-----
-)";
-
     // ECDSA P-256 public key for firmware signature verification
     // Generated using scripts/generate_ota_keys.sh
     // Fingerprint: 882517373e7bac2b9f552445d3f8269f15a35998a4c7f52866cd56810620d752
@@ -130,5 +123,6 @@ MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEpaUoIStuizMGtDR9hJ7SeY8gX9m4
 -----END PUBLIC KEY-----
 )";
 
-    bool verifyFirmwareHash(Stream& stream, size_t size, const String& expectedHash);
+    // Helper to parse serverUrl into host and port
+    void parseServerUrl(String& host, uint16_t& port);
 };

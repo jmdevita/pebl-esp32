@@ -70,26 +70,29 @@ enum LogLevel {
 LogLevel currentLogLevel = LOG_WARN;  // Production: WARN, Debug: INFO/DEBUG
 
 // Structured logging with AI-friendly format
+// Uses single Serial.println() for atomic output to prevent corruption from interrupts
 void logMessage(LogLevel level, const char* module, const char* message, const char* kvPairs = nullptr) {
     if (level > currentLogLevel) return;
 
     const char* levelStr[] = {"ERROR", "WARN", "INFO", "DEBUG", "TEST"};
 
-    Serial.print("[");
-    Serial.print(millis());
-    Serial.print("][");
-    Serial.print(levelStr[level]);
-    Serial.print("][");
-    Serial.print(module);
-    Serial.print("] ");
-    Serial.print(message);
+    // Pre-format entire log message into buffer for atomic output
+    // This prevents UART corruption when interrupts (ADC, SPI, WiFi) fire mid-transmission
+    char logBuf[256];
 
     if (kvPairs) {
-        Serial.print(" | ");
-        Serial.print(kvPairs);
+        snprintf(logBuf, sizeof(logBuf), "[%lu][%s][%s] %s | %s",
+                millis(), levelStr[level], module, message, kvPairs);
+    } else {
+        snprintf(logBuf, sizeof(logBuf), "[%lu][%s][%s] %s",
+                millis(), levelStr[level], module, message);
     }
 
-    Serial.println();
+    // Single atomic write prevents corruption from concurrent interrupts
+    Serial.println(logBuf);
+
+    // Flush output buffer to ensure transmission completes before potential interrupt
+    Serial.flush();
 }
 
 // Overload for ConfigManager compatibility
@@ -126,7 +129,6 @@ namespace BatteryConstants {
     // Hysteresis prevents oscillation: different thresholds for each direction
     constexpr float USB_HIGH_VOLTAGE_THRESHOLD = 4.05f;    // Battery→USB: Detect while charging (87%+)
     constexpr float USB_TO_BATTERY_THRESHOLD = 4.15f;      // USB→Battery: Require drop to 4.15V
-    constexpr float BATTERY_LOW_VOLTAGE_THRESHOLD = 3.85f; // Deprecated - using hysteresis instead
     constexpr float VOLTAGE_STABILITY_THRESHOLD = 0.002f;  // USB has very low variance (<0.002V²)
 
     // LiPo voltage range (MakerFocus specs + Adafruit data)
@@ -229,7 +231,10 @@ RTC_DATA_ATTR struct {
 // Track what the display is showing (survives deep sleep)
 RTC_DATA_ATTR bool displayShowingBattery = false;
 
-// Track if device woke from sleep on battery (used for Bug #2 fix - different timeouts)
+// Track if device woke from sleep on battery (survives deep sleep)
+// Used to differentiate between two battery scenarios with different timeout behaviors:
+// - Wake on battery: Device was already unplugged before sleep (use 20s timeout for efficiency)
+// - USB unplugged: Transitioned from USB→battery while awake (use 60s grace period for stability)
 RTC_DATA_ATTR bool wokeOnBattery = false;
 
 // Power management state (survives deep sleep)
@@ -269,7 +274,6 @@ unsigned long lastOTACheckMillis = 0;  // millis() when last OTA check performed
 // Forward declarations
 void handleWebSocketMessage(const uint8_t* payload, size_t length);
 void gracefulShutdown(const char* reason, bool clearDisplay);
-float getBatteryVoltage();
 int getBatteryPercentage();
 int getBatteryLevel();
 bool isUSBPowered();
@@ -598,8 +602,10 @@ public:
         // Show battery status text in top center when on battery power
         // Status varies by battery percentage: BATTERY / LOW BATT / CHARGE NOW
 
-        // TODO: Optimize - currently calls getBatteryStatus() twice (isUSBPowered + getBatteryPercentage)
-        // Should cache BatteryStatus and pass to both drawPowerStatusIndicator and drawBatteryIndicator
+        // OPTIMIZATION OPPORTUNITY: Currently calls getBatteryStatus() multiple times per display update
+        // (once here in drawPowerStatusIndicator, again in drawBatteryIndicator)
+        // Better approach: Call getBatteryStatus() once in showReaction(), pass struct to both functions
+        // Impact: Minor (~10ms savings on ESP32), but cleaner architecture
 
         if (!isUSBPowered()) {
             int batteryPercentage = getBatteryPercentage();
@@ -812,7 +818,7 @@ public:
                 int16_t messageX = 60;
                 int16_t messageMaxWidth = display->width() - messageX - rightMargin;
                 String messageStr = truncateToFit(message, &FreeSans9pt7b, messageX, messageMaxWidth);
-                display->setCursor(messageX, 68);  // Moved from 63 to 68 for small whitespace
+                display->setCursor(messageX, 68);  // Y=68 provides spacing between username and message text
                 display->print(messageStr);
             }
 
@@ -954,15 +960,6 @@ private:
 
         // Fallback: just return "..." if even 3 chars don't fit
         return "...";
-    }
-
-    // Legacy truncation by character count (kept for backward compatibility)
-    static String truncateString(const char* str, size_t maxLength) {
-        String result(str);
-        if (result.length() > maxLength) {
-            result = result.substring(0, maxLength) + "...";
-        }
-        return result;
     }
 };
 
@@ -1126,8 +1123,8 @@ BatteryStatus getBatteryStatus() {
     return status;
 }
 
-// Legacy wrapper functions for backward compatibility
-float getBatteryVoltage() { return getBatteryStatus().voltage; }
+// Single-field accessor wrappers for getBatteryStatus()
+// Use these when you only need one field to avoid unpacking the full struct
 int getBatteryPercentage() { return getBatteryStatus().percentage; }
 int getBatteryLevel() { return getBatteryStatus().level; }
 bool isUSBPowered() { return getBatteryStatus().isUSBPowered; }
@@ -1347,6 +1344,7 @@ uint32_t calculateSleepDuration() {
 // Global flags for sleep state management
 static bool enteringSleep = false;      // Set when entering deep sleep
 static bool justWokeFromSleep = false;  // Set on wake, cleared after first connection
+static bool otaCheckedThisBoot = false; // Track if OTA check completed this boot (prevents duplicate checks)
 
 void gracefulShutdown(const char* reason, bool clearDisplay = false) {
     char logBuf[128];
@@ -1448,9 +1446,10 @@ void webSocketEvent(WStype_t type, uint8_t* payload, size_t length) {
             metrics.failedConnections++;
             ResilienceManager::markConnectionLost();  // Track connection loss
 
-            // Only show disconnect message after 10+ failed attempts (real problem, not temporary disconnect)
-            // This preserves the reaction display during normal reconnections and sleep cycles
-            if (!enteringSleep && metrics.failedConnections >= 10) {
+            // Show disconnect message ONCE after 10 failed attempts (not on every subsequent disconnect)
+            // This prevents repeated e-paper refreshes that drain battery and are visually disruptive
+            // After the initial warning, preserve the "Connection Lost" display until reconnected
+            if (!enteringSleep && metrics.failedConnections == 10) {
                 DisplayManager::showMessage("Connection Lost", "Check WiFi/Server");
             }
             break;
@@ -1502,6 +1501,24 @@ void webSocketEvent(WStype_t type, uint8_t* payload, size_t length) {
                 } else {
                     logMessage(LOG_WARN, "WS", "Failed to decode AES key for registration");
                 }
+            }
+
+            // Check for firmware updates on first WebSocket connection (power-on boot only)
+            // Timing: Performed here instead of immediately after WiFi connect ensures DNS has fully
+            // propagated and stabilized. WebSocket connection success confirms DNS is working.
+            // This prevents spurious "DNS Failed" errors during OTA hostname resolution.
+            if (!otaCheckedThisBoot && !justWokeFromSleep) {
+                otaCheckedThisBoot = true;  // Mark as checked to prevent duplicate checks on reconnects
+                logMessage(LOG_INFO, "OTA", "First connection established - checking for firmware updates");
+
+                // DNS stabilization: Allow additional time after WebSocket connection before making
+                // new DNS queries. Even though WebSocket connected successfully, the DNS resolver
+                // may need time to fully stabilize its cache and state. This prevents transient
+                // "DNS Failed" errors on the first HTTP request after WebSocket establishment.
+                delay(2000);  // 2-second stabilization period
+
+                checkForFirmwareUpdate();
+                lastOTACheckMillis = millis();
             }
 
             // Only show "Connected!" message if NOT waking from sleep (preserve reaction display)
@@ -2125,11 +2142,12 @@ public:
                 powerName = "HIGH";
             }
 
+            WiFi.begin(cfg.wifi.ssid.c_str(), cfg.wifi.password.c_str());
+
+            // Set TX power after WiFi.begin() to avoid "Neither AP or STA has been started" warning
             WiFi.setTxPower(txPower);
             snprintf(logBuf, sizeof(logBuf), "tx_power=%s", powerName);
             logMessage(LOG_DEBUG, "WIFI", "Setting TX power", logBuf);
-
-            WiFi.begin(cfg.wifi.ssid.c_str(), cfg.wifi.password.c_str());
 
             const uint32_t startTime = millis();
             while (WiFi.status() != WL_CONNECTED) {
@@ -2381,6 +2399,18 @@ private:
 // ============================================================================
 void setup() {
     Serial.begin(115200);
+
+    // Check wake reason early to apply UART stabilization if needed
+    esp_sleep_wakeup_cause_t wakeup_reason = esp_sleep_get_wakeup_cause();
+
+    // UART stabilization: After deep sleep wake, the UART peripheral needs extra time
+    // to stabilize its clock/timing circuits before transmitting data reliably.
+    // Without this delay, the first ~50 characters get corrupted (bit-level framing errors).
+    // Power-on boots don't need this delay since the UART initializes cleanly.
+    if (wakeup_reason == ESP_SLEEP_WAKEUP_TIMER || wakeup_reason == ESP_SLEEP_WAKEUP_EXT0) {
+        delay(100);  // 100ms allows UART clock to lock and stabilize
+    }
+
     while (!Serial && millis() < 3000) {
         // Wait for serial port to connect (timeout after 3 seconds)
     }
@@ -2393,7 +2423,6 @@ void setup() {
 
     // Check wake reason
     ++bootCount;
-    esp_sleep_wakeup_cause_t wakeup_reason = esp_sleep_get_wakeup_cause();
 
     // Track if this is a wake from deep sleep (to skip boot screens)
     bool isWakeFromSleep = false;
@@ -2622,7 +2651,8 @@ void setup() {
             bool isOnBatteryNow = !batteryStatus.isUSBPowered;
             bool powerStateChanged = (displayShowingBattery != isOnBatteryNow);
 
-            // Set flag if we woke on battery (used for Bug #2 fix - different timeouts)
+            // Track wake power state to determine appropriate battery timeout later
+            // This flag persists across deep sleep cycles for timeout differentiation
             wokeOnBattery = isOnBatteryNow;
             if (wokeOnBattery) {
                 // Initialize battery mode timing - start counting from wake (millis() = 0)
@@ -2655,9 +2685,10 @@ void setup() {
                     logMessage(LOG_INFO, "DISPLAY", "Preserving display - will update on new message only");
                 }
             } else {
-                // Legacy behavior: Always refresh on wake
+                // Fallback mode: skip_refresh_on_no_message disabled
+                // Always refresh display on wake (consumes more battery but ensures display updates)
                 shouldRefreshDisplay = true;
-                logMessage(LOG_INFO, "DISPLAY", "Legacy mode - always refresh on wake");
+                logMessage(LOG_INFO, "DISPLAY", "Refresh optimization disabled - always refreshing on wake");
             }
 
             // Perform display refresh if needed
@@ -2771,8 +2802,13 @@ void setup() {
         logMessage(LOG_INFO, "OTA", "Initializing OTA manager");
 
         // Build server URL from config components
-        String serverUrl = String(cfg.server.use_ssl ? "https://" : "http://") +
-                          cfg.server.host + ":" + String(cfg.server.port);
+        // Only include port if non-default (443 for HTTPS, 80 for HTTP)
+        // This prevents potential HTTP client parsing issues with explicit default ports
+        String serverUrl = String(cfg.server.use_ssl ? "https://" : "http://") + cfg.server.host;
+        if ((cfg.server.use_ssl && cfg.server.port != 443) ||
+            (!cfg.server.use_ssl && cfg.server.port != 80)) {
+            serverUrl += ":" + String(cfg.server.port);
+        }
 
         otaManager = new OTAManager(serverUrl, cfg.device.id);
 
@@ -2781,16 +2817,8 @@ void setup() {
             logMessage(LOG_INFO, "OTA", "Boot validation successful - new firmware marked as valid");
         }
 
-        // Check for firmware updates on power-on boot only (not wake from sleep)
-        // This prevents unnecessary battery drain from checking on every wake cycle
-        // Updates are primarily delivered via WebSocket push notifications
-        if (!isWakeFromSleep) {
-            logMessage(LOG_INFO, "OTA", "Power-on boot - checking for firmware updates");
-            checkForFirmwareUpdate();
-            lastOTACheckMillis = millis();
-        } else {
-            logMessage(LOG_INFO, "OTA", "Wake from sleep - skipping OTA check (updates delivered via WebSocket)");
-        }
+        // Firmware update check occurs automatically on first WebSocket connection (power-on boot only)
+        // See WStype_CONNECTED handler for implementation. Deferred timing ensures DNS stability.
     }
 
     logMessage(LOG_INFO, "SYSTEM", "Setup complete");
@@ -3001,14 +3029,16 @@ void loop() {
                 // Calculate time on battery (rollover-safe)
                 unsigned long timeOnBattery = (unsigned long)(now - batteryModeStartTime);
 
-                // Bug #2 Fix: Different timeouts for different scenarios
-                // - Woke on battery (batteryModeStartTime was 0): Use short timeout (20s)
-                // - USB unplugged (batteryModeStartTime was set during runtime): Use grace period (60s)
+                // Battery timeout varies by power transition scenario for optimal behavior:
+                // Scenario 1: Woke on battery (batteryModeStartTime = 0, wokeOnBattery = true)
+                //   → Use 20s timeout: Device was already unplugged, minimize battery drain
+                // Scenario 2: USB unplugged while awake (batteryModeStartTime > 0, set during runtime)
+                //   → Use 60s grace period: Allow user to finish interactions after unplugging
                 unsigned long sleepTimeout;
                 const char* timeoutReason;
 
-                // Check if we woke on battery: batteryModeStartTime will be 0 and wokeOnBattery true
-                // After USB unplug: batteryModeStartTime will be > 0 (set to current millis)
+                // Detect scenario: batteryModeStartTime=0 means we woke already on battery
+                // batteryModeStartTime>0 means USB was unplugged during this wake cycle
                 bool isWakeOnBattery = (wokeOnBattery && wasPreviouslyOnBattery && batteryModeStartTime == 0);
 
                 if (isWakeOnBattery) {
@@ -3098,11 +3128,14 @@ void checkForFirmwareUpdate() {
             pendingVersion = info.version;
         }
     } else {
+        // checkForUpdate returns false for two normal cases:
+        // 1. No firmware configured on server
+        // 2. Already up to date
+        // OTAManager logs detailed status internally, so only log errors here
         if (otaManager->getStatus() == OTAManager::OTAStatus::FAILED) {
             logMessage(LOG_ERROR, "OTA", "Update check failed", otaManager->getLastError().c_str());
-        } else {
-            logMessage(LOG_INFO, "OTA", "No updates available");
         }
+        // Success case (up to date or no firmware) already logged by OTAManager
     }
 }
 

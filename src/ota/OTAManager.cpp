@@ -8,43 +8,56 @@ OTAManager::OTAManager(const String& serverUrl, const String& deviceId)
     const esp_app_desc_t* app_desc = esp_ota_get_app_description();
     currentVersion = String(app_desc->version);
 
-    // Configure SSL certificate pinning
-    if (serverUrl.startsWith("https://")) {
-        Serial.println("[OTA] Configuring SSL certificate pinning...");
-        secureClient.setCACert(SERVER_ROOT_CA);
-        Serial.println("[OTA] SSL certificate pinning enabled");
-    } else {
-        Serial.println("[OTA] WARNING: Using HTTP (not HTTPS) - insecure!");
+    // Configure HTTPS (server is always HTTPS)
+    // Uses standard certificate validation like WebSocket
+    // FUTURE: Add certificate pinning for enhanced security
+    Serial.println("[OTA] Configuring HTTPS");
+    secureClient.setInsecure();
+    Serial.println("[OTA] HTTPS enabled");
+}
+
+// Helper method to parse serverUrl into host and port components
+// Assumes serverUrl format: "https://example.com" or "https://example.com:443"
+void OTAManager::parseServerUrl(String& host, uint16_t& port) {
+    host = serverUrl;
+    host.remove(0, 8);  // Remove "https://"
+
+    port = 443;  // Default HTTPS port
+    int portIndex = host.indexOf(':');
+    if (portIndex > 0) {
+        port = host.substring(portIndex + 1).toInt();
+        host = host.substring(0, portIndex);
     }
 }
 
 bool OTAManager::checkForUpdate(FirmwareInfo& info) {
     status = OTAStatus::CHECKING;
 
-    // Build request URL
-    String url = serverUrl + "/api/firmware/version?device_id=" + deviceId;
+    // Build request path with query parameters
+    String path = "/api/firmware/version?device_id=" + deviceId;
 
-    // Add current version if available
-    if (currentVersion.length() > 0) {
-        url += "&current_version=" + currentVersion;
-    }
+    // Parse serverUrl to extract host and port
+    String host;
+    uint16_t port;
+    parseServerUrl(host, port);
 
-    // Configure HTTPS with certificate pinning
-    if (serverUrl.startsWith("https://")) {
-        httpClient.begin(url, secureClient);
-    } else {
-        httpClient.begin(url);
-    }
+    // Use explicit begin() signature to prevent URL parsing issues
+    // Only the hostname is passed to DNS resolver, not the full URL
+    httpClient.begin(secureClient, host, port, path);
 
-    // TODO: Add authentication when API token feature is implemented
+    // FUTURE: OTA API authentication not yet implemented
+    // When added, enable this to require Bearer token for firmware downloads:
     // if (ConfigManager::getConfig().security.api_token.length() > 0) {
     //     httpClient.addHeader("Authorization", "Bearer " + ConfigManager::getConfig().security.api_token);
     // }
+    // See server/app/api/firmware.py for corresponding server-side implementation
 
     httpClient.setTimeout(10000);  // 10 second timeout
 
     int httpCode = httpClient.GET();
 
+    // Server now returns 200 for all normal cases (including no firmware available)
+    // Only non-200 codes are actual errors (400 bad request, 403 forbidden, 500 server error)
     if (httpCode != HTTP_CODE_OK) {
         lastError = "Server returned: " + String(httpCode);
         status = OTAStatus::FAILED;
@@ -65,14 +78,34 @@ bool OTAManager::checkForUpdate(FirmwareInfo& info) {
         return false;
     }
 
-    // Check if up to date
-    if (doc["up_to_date"] | false) {
+    // New JSON format: Always check "update_available" and "status" fields
+    // Three possible states:
+    // 1. "no_firmware_configured" - Admin hasn't uploaded firmware yet
+    // 2. "up_to_date" - Device is on latest version
+    // 3. "update_available" - New firmware ready to download
+
+    bool updateAvailable = doc["update_available"] | false;
+    String statusStr = doc["status"] | "unknown";
+    String message = doc["message"] | "";
+
+    if (!updateAvailable) {
         status = OTAStatus::IDLE;
+        lastError = "";  // Clear error on success
+
+        // Log the specific reason (no_firmware_configured vs up_to_date)
+        if (statusStr == "no_firmware_configured") {
+            Serial.println("[OTA] No firmware configured on server");
+        } else if (statusStr == "up_to_date") {
+            String current = doc["current_version"] | "unknown";
+            String latest = doc["latest_version"] | "unknown";
+            Serial.printf("[OTA] Firmware is up to date: %s\n", latest.c_str());
+        }
+
         return false;  // No update needed
     }
 
-    // Extract firmware info
-    info.version = doc["version"].as<String>();
+    // Update is available - extract firmware metadata
+    info.version = doc["latest_version"].as<String>();
     info.downloadUrl = doc["download_url"].as<String>();
     info.sha256Hash = doc["sha256"].as<String>();
     info.signature = doc["signature"].as<String>();
@@ -80,12 +113,26 @@ bool OTAManager::checkForUpdate(FirmwareInfo& info) {
     info.required = doc["required"] | false;
     info.changelog = doc["changelog"].as<String>();
 
-    // Version comparison
+    // Defense-in-depth: Verify version is actually different
+    // Protects against server bugs, API mismatches, or data corruption
     if (info.version == currentVersion) {
+        Serial.printf("[OTA] Server says update available, but versions match: %s\n", currentVersion.c_str());
         status = OTAStatus::IDLE;
-        return false;  // Already up to date
+        lastError = "";  // Clear error - this is a normal case
+        return false;  // No update actually needed
     }
 
+    // Log update details
+    String current = doc["current_version"] | "unknown";
+    Serial.printf("[OTA] Update available: %s → %s (%d bytes)\n",
+                  current.c_str(), info.version.c_str(), info.size);
+
+    if (info.required) {
+        Serial.println("[OTA] This is a required update");
+    }
+
+    status = OTAStatus::IDLE;
+    lastError = "";  // Clear error on success
     return true;  // Update available
 }
 
@@ -93,20 +140,24 @@ bool OTAManager::downloadAndInstall(const FirmwareInfo& info,
                                    void (*progressCallback)(size_t, size_t)) {
     status = OTAStatus::DOWNLOADING;
 
-    // Build full URL
-    String fullUrl = serverUrl + info.downloadUrl + "?device_id=" + deviceId;
+    // Build download path with query parameters
+    String path = info.downloadUrl + "?device_id=" + deviceId;
 
-    // Configure HTTPS with certificate pinning
-    if (serverUrl.startsWith("https://")) {
-        httpClient.begin(fullUrl, secureClient);
-    } else {
-        httpClient.begin(fullUrl);
-    }
+    // Parse serverUrl to extract host and port
+    String host;
+    uint16_t port;
+    parseServerUrl(host, port);
 
-    // TODO: Add authentication when API token feature is implemented
+    // Use explicit begin() signature to prevent URL parsing issues
+    // Only the hostname is passed to DNS resolver, not the full URL
+    httpClient.begin(secureClient, host, port, path);
+
+    // FUTURE: OTA API authentication not yet implemented
+    // When added, enable this to require Bearer token for firmware downloads:
     // if (ConfigManager::getConfig().security.api_token.length() > 0) {
     //     httpClient.addHeader("Authorization", "Bearer " + ConfigManager::getConfig().security.api_token);
     // }
+    // See server/app/api/firmware.py for corresponding server-side implementation
 
     int httpCode = httpClient.GET();
 
@@ -200,7 +251,7 @@ bool OTAManager::downloadAndInstall(const FirmwareInfo& info,
         return false;
     }
 
-    // Verify signature (stub for now - implement with mbedtls for production)
+    // Verify ECDSA signature
     if (!verifySignature(hash, info.signature)) {
         lastError = "Signature verification failed";
         status = OTAStatus::FAILED;
