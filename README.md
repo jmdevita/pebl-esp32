@@ -65,6 +65,15 @@ See [docs/DISPLAY_SUPPORT.md](docs/DISPLAY_SUPPORT.md) for detailed driver infor
 2. **USB Driver** - CH340/CH341 or CP2102 depending on your board
 3. **LilyGo T5 Board** - One of the supported models
 
+## Documentation
+
+- **[Version Management](docs/VERSION_MANAGEMENT.md)** - How to manage firmware versions and releases
+- **[Display Support](docs/DISPLAY_SUPPORT.md)** - Supported displays and driver details
+- **[Installation Guide](docs/INSTALLATION_GUIDE.md)** - Detailed setup instructions
+- **[WiFi Improvements](docs/WIFI_IMPROVEMENTS.md)** - WiFi optimization and troubleshooting
+- **[USB & Battery Detection](docs/USB_BATTERY_DETECTION.md)** - Power management details
+- **[Security Notes](docs/SECURITY_NOTES.md)** - Encryption and security information
+
 ## Installation
 
 ### 1. Clone and Navigate

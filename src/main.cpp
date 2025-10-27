@@ -57,6 +57,17 @@ RTC_DATA_ATTR bool hasEverSynced = false;           // True if we've successfull
 // #define ENABLE_DEBUG_FEATURES  // Uncomment for debugging/testing
 
 // ============================================================================
+// Connection Timing Constants
+// ============================================================================
+// These are hardcoded to match server protocol and prevent user misconfiguration
+namespace ConnectionTiming {
+    constexpr uint32_t HEARTBEAT_INTERVAL_MS = 15000;      // Expect heartbeat every 15s
+    constexpr uint32_t HEARTBEAT_TIMEOUT_MS = 30000;       // Consider connection dead after 30s
+    constexpr uint32_t WS_INITIAL_RECONNECT_MS = 15000;    // Wait 15s before first retry
+    constexpr uint32_t WS_MAX_RECONNECT_MS = 60000;        // Max 60s between retries (exponential backoff)
+}
+
+// ============================================================================
 // Log Levels and System
 // ============================================================================
 enum LogLevel {
@@ -1138,22 +1149,19 @@ bool isUSBPowered() { return getBatteryStatus().isUSBPowered; }
  * Returns true if successful, false otherwise
  */
 bool fetchTimezoneFromAPI() {
-    const AppConfig& cfg = ConfigManager::getConfig();
-
-    if (cfg.timezone.api_key.isEmpty()) {
-        logMessage(LOG_WARN, "TIME", "No API key configured, skipping timezone sync");
-        return false;
-    }
+    // Timezone API settings (hardcoded - ipgeolocation.io free tier)
+    constexpr const char* TIMEZONE_API_URL = "https://api.ipgeolocation.io/timezone";
+    constexpr const char* TIMEZONE_API_KEY = "420755f05aa14c8f96f8dae5d8176022";
 
     HTTPClient http;
     http.setTimeout(5000);  // 5 second timeout
 
     // Build URL with API key
-    String url = cfg.timezone.api_url + "?apiKey=" + cfg.timezone.api_key;
+    String url = String(TIMEZONE_API_URL) + "?apiKey=" + TIMEZONE_API_KEY;
     http.begin(url);
 
     char logBuf[128];
-    snprintf(logBuf, sizeof(logBuf), "url=%s", cfg.timezone.api_url.c_str());
+    snprintf(logBuf, sizeof(logBuf), "url=%s", TIMEZONE_API_URL);
     logMessage(LOG_INFO, "TIME", "Fetching timezone from API", logBuf);
 
     int httpCode = http.GET();
@@ -1776,16 +1784,15 @@ void processSerialCommand(const String& command) {
                      cfg.device.id.c_str(), cfg.device.name.c_str());
             logMessage(LOG_TEST, "CONFIG", "Device", buf);
 
-            snprintf(buf, sizeof(buf), "ssid=%s timeout=%lu",
-                     cfg.wifi.ssid.c_str(), cfg.wifi.timeout_ms);
+            snprintf(buf, sizeof(buf), "timeout=%lu force_high=%s",
+                     cfg.wifi.timeout_ms, cfg.wifi.force_high_power ? "true" : "false");
             logMessage(LOG_TEST, "CONFIG", "WiFi", buf);
 
             snprintf(buf, sizeof(buf), "host=%s port=%d ssl=%s",
                      cfg.server.host.c_str(), cfg.server.port, cfg.server.use_ssl ? "true" : "false");
             logMessage(LOG_TEST, "CONFIG", "Server", buf);
 
-            snprintf(buf, sizeof(buf), "width=%d height=%d rotation=%d",
-                     cfg.display.width, cfg.display.height, cfg.display.rotation);
+            snprintf(buf, sizeof(buf), "rotation=%d", cfg.display.rotation);
             logMessage(LOG_TEST, "CONFIG", "Display", buf);
         } else {
             logMessage(LOG_TEST, "CONFIG", "Configuration not loaded!");
@@ -1801,13 +1808,7 @@ void processSerialCommand(const String& command) {
             AppConfig& cfg = ConfigManager::getMutableConfig();
             bool updated = false;
 
-            if (key == "wifi.ssid") {
-                cfg.wifi.ssid = value;
-                updated = true;
-            } else if (key == "wifi.password") {
-                cfg.wifi.password = value;
-                updated = true;
-            } else if (key == "device.id") {
+            if (key == "device.id") {
                 cfg.device.id = value;
                 updated = true;
             } else if (key == "device.name") {
@@ -1854,8 +1855,8 @@ void processSerialCommand(const String& command) {
         if (ConfigManager::load()) {
             const AppConfig& cfg = ConfigManager::getConfig();
             char buf[256];
-            snprintf(buf, sizeof(buf), "device_id=%s wifi_ssid=%s",
-                     cfg.device.id.c_str(), cfg.wifi.ssid.c_str());
+            snprintf(buf, sizeof(buf), "device_id=%s server=%s:%d",
+                     cfg.device.id.c_str(), cfg.server.host.c_str(), cfg.server.port);
             logMessage(LOG_TEST, "CONFIG", "Configuration reloaded", buf);
         } else {
             logMessage(LOG_ERROR, "CONFIG", "Failed to reload configuration");
@@ -2064,12 +2065,6 @@ public:
         const AppConfig& cfg = ConfigManager::getConfig();
         char logBuf[128];
 
-        // If no WiFi credentials configured, go straight to provisioning
-        if (cfg.wifi.ssid.isEmpty()) {
-            logMessage(LOG_WARN, "WIFI", "No credentials configured, entering provisioning mode");
-            return startProvisioning();
-        }
-
         // Check WiFi fallback mode (low-power mode after repeated failures)
         if (wifiPowerState.wifiDisabledMode) {
             wifiPowerState.fallbackWakeCount++;
@@ -2097,38 +2092,21 @@ public:
         const uint32_t retryDelay = 5000;  // 5 seconds between retries
 
         for (int attempt = 1; attempt <= maxRetries; attempt++) {
-            snprintf(logBuf, sizeof(logBuf), "attempt=%d/%d ssid=%s", attempt, maxRetries, cfg.wifi.ssid.c_str());
+            snprintf(logBuf, sizeof(logBuf), "attempt=%d/%d", attempt, maxRetries);
             logMessage(LOG_INFO, "WIFI", "Connecting", logBuf);
-
-            // Only show WiFi connection screens on first boot, not on wake from sleep
-            if (!silent) {
-                String message = "Connecting";
-                if (attempt > 1) {
-                    message += " (" + String(attempt) + "/" + String(maxRetries) + ")";
-                }
-                DisplayManager::showMessage(message, cfg.wifi.ssid);
-            }
 
             WiFi.mode(WIFI_STA);
 
-            // Apply TX power (priority: forced > adaptive > default)
+            // Apply TX power: force HIGH or use adaptive (LOW → MEDIUM → HIGH)
             wifi_power_t txPower = wifiPowerState.currentPower;
             const char* powerName = "UNKNOWN";
 
-            if (!cfg.wifi.force_tx_power.isEmpty()) {
-                // User forced a specific power level (takes priority, works with or without adaptive)
-                if (cfg.wifi.force_tx_power == "LOW") {
-                    txPower = WIFI_POWER_11dBm;
-                    powerName = "LOW";
-                } else if (cfg.wifi.force_tx_power == "MEDIUM") {
-                    txPower = WIFI_POWER_15dBm;
-                    powerName = "MEDIUM";
-                } else if (cfg.wifi.force_tx_power == "HIGH") {
-                    txPower = WIFI_POWER_19_5dBm;
-                    powerName = "HIGH";
-                }
-            } else if (cfg.wifi.adaptive_tx_power) {
-                // Use adaptive power from RTC memory
+            if (cfg.wifi.force_high_power) {
+                // Force HIGH power mode (disables adaptive escalation)
+                txPower = WIFI_POWER_19_5dBm;
+                powerName = "HIGH (forced)";
+            } else {
+                // Use adaptive power from RTC memory (starts at LOW, auto-escalates on failures)
                 if (txPower == WIFI_POWER_11dBm) {
                     powerName = "LOW";
                 } else if (txPower == WIFI_POWER_15dBm) {
@@ -2136,13 +2114,11 @@ public:
                 } else {
                     powerName = "HIGH";
                 }
-            } else {
-                // Adaptive disabled and no force - use default HIGH
-                txPower = WIFI_POWER_19_5dBm;
-                powerName = "HIGH";
             }
 
-            WiFi.begin(cfg.wifi.ssid.c_str(), cfg.wifi.password.c_str());
+            // WiFi.begin() with no parameters uses credentials stored in ESP32 NVS
+            // These are saved by WiFiManager during provisioning mode
+            WiFi.begin();
 
             // Set TX power after WiFi.begin() to avoid "Neither AP or STA has been started" warning
             WiFi.setTxPower(txPower);
@@ -2166,8 +2142,8 @@ public:
                          WiFi.localIP().toString().c_str(), rssi, powerName);
                 logMessage(LOG_INFO, "WIFI", "Connected", logBuf);
 
-                // Reset adaptive power failures on successful connection
-                if (cfg.wifi.adaptive_tx_power) {
+                // Reset adaptive power failures on successful connection (unless forced HIGH)
+                if (!cfg.wifi.force_high_power) {
                     wifiPowerState.consecutiveFailures = 0;
                     wifiPowerState.totalFailedWakes = 0;
                     // Keep current power level (sticky behavior)
@@ -2176,18 +2152,11 @@ public:
                 // Give DNS servers time to be ready (prevents early OTA check failures)
                 delay(2000);
 
-                // Only show WiFi connected screen on first boot
-                if (!silent) {
-                    DisplayManager::showMessage("WiFi Connected",
-                                               WiFi.localIP().toString(),
-                                               "",
-                                               "Connecting to server...");
-                }
                 return true;
             }
 
-            // Failed attempt - handle adaptive power escalation
-            if (cfg.wifi.adaptive_tx_power && cfg.wifi.force_tx_power.isEmpty()) {
+            // Failed attempt - handle adaptive power escalation (only if not forcing HIGH)
+            if (!cfg.wifi.force_high_power) {
                 wifiPowerState.consecutiveFailures++;
                 wifiPowerState.totalFailedWakes++;
 
@@ -2266,12 +2235,7 @@ public:
 
         // Try to connect or start AP
         if (wm.autoConnect(apName)) {
-            // Connected! Save credentials to ConfigManager
-            AppConfig& cfg = ConfigManager::getMutableConfig();
-            cfg.wifi.ssid = WiFi.SSID();
-            cfg.wifi.password = WiFi.psk();
-            ConfigManager::save();
-
+            // Connected! Credentials are automatically saved to NVS by WiFiManager
             char logBuf[128];
             snprintf(logBuf, sizeof(logBuf), "ip=%s ssid=%s",
                      WiFi.localIP().toString().c_str(), WiFi.SSID().c_str());
@@ -2301,9 +2265,15 @@ public:
                  cfg.server.host.c_str(), cfg.server.port, cfg.device.id.c_str());
         logMessage(LOG_INFO, "WS", "Connecting", logBuf);
 
-        // Build WebSocket path
+        // Build WebSocket path with device_id and display_variant
         String path = cfg.server.path + "?rpi_id=";
         path += cfg.device.id;
+
+        // Add display_variant if configured (for OTA firmware tracking)
+        if (!cfg.device.display_variant.isEmpty()) {
+            path += "&display_variant=";
+            path += cfg.device.display_variant;
+        }
 
         // Use beginSSL for secure WebSocket connection if configured
         if (cfg.server.use_ssl) {
@@ -2317,8 +2287,8 @@ public:
         // Disable library auto-reconnect (manual handling) and internal heartbeat (conflicts with server heartbeats)
         webSocket.setReconnectInterval(0);
 
-        // Update reconnect delay from config
-        reconnectDelay = cfg.timing.ws_initial_reconnect_ms;
+        // Update reconnect delay
+        reconnectDelay = ConnectionTiming::WS_INITIAL_RECONNECT_MS;
     }
 
     static void handleReconnection() {
@@ -2334,9 +2304,10 @@ public:
 
 private:
     static void handleWiFiReconnection() {
-        const AppConfig& cfg = ConfigManager::getConfig();
         const uint32_t now = millis();
-        if (now - lastWiFiReconnect > cfg.wifi.reconnect_interval_ms) {
+        // WiFi reconnect interval: 30 seconds
+        constexpr uint32_t WIFI_RECONNECT_INTERVAL_MS = 30000;
+        if (now - lastWiFiReconnect > WIFI_RECONNECT_INTERVAL_MS) {
             lastWiFiReconnect = now;
             logMessage(LOG_WARN, "WIFI", "Reconnecting");
             WiFi.reconnect();
@@ -2361,11 +2332,11 @@ private:
                 connectWebSocket();
 
                 // Exponential backoff with maximum
-                reconnectDelay = min(reconnectDelay * 2, cfg.timing.ws_max_reconnect_ms);
+                reconnectDelay = min(reconnectDelay * 2, ConnectionTiming::WS_MAX_RECONNECT_MS);
             }
         } else {
             // Reset reconnect delay on successful connection
-            reconnectDelay = cfg.timing.ws_initial_reconnect_ms;
+            reconnectDelay = ConnectionTiming::WS_INITIAL_RECONNECT_MS;
         }
     }
 
@@ -2375,7 +2346,7 @@ private:
             uint32_t timeSinceHeartbeat = (unsigned long)(millis() - lastHeartbeat);
             // Only disconnect if we haven't received ANY messages (not just heartbeats) for double the timeout
             // The WebSocketsClient has its own ping/pong mechanism that should keep the connection alive
-            if (timeSinceHeartbeat > (cfg.timing.heartbeat_timeout_ms * 2)) {
+            if (timeSinceHeartbeat > (ConnectionTiming::HEARTBEAT_TIMEOUT_MS * 2)) {
                 char logBuf[64];
                 snprintf(logBuf, sizeof(logBuf), "last_seen_ms=%lu", timeSinceHeartbeat);
                 logMessage(LOG_WARN, "WS", "Connection appears stale, forcing reconnect", logBuf);
@@ -2384,7 +2355,7 @@ private:
                 wsConnected = false;
                 webSocket.disconnect();
                 lastHeartbeat = 0;
-            } else if (timeSinceHeartbeat > cfg.timing.heartbeat_timeout_ms) {
+            } else if (timeSinceHeartbeat > ConnectionTiming::HEARTBEAT_TIMEOUT_MS) {
                 // Just log a warning but don't disconnect yet
                 char logBuf[64];
                 snprintf(logBuf, sizeof(logBuf), "last_heartbeat_ms=%lu", timeSinceHeartbeat);
@@ -2477,8 +2448,17 @@ void setup() {
     // Initialize display
     logMessage(LOG_INFO, "DISPLAY", "Initializing");
 
-    // Configure SPI pins based on configuration
-    SPI.begin(cfg.display.pins.sclk, -1, cfg.display.pins.mosi, cfg.display.pins.cs);
+    // Hardware-specific pin definitions (LilyGo T5 V2.3.1)
+    // These pins are determined by the PCB layout and cannot be changed
+    constexpr uint8_t PIN_DISPLAY_CS = 5;
+    constexpr uint8_t PIN_DISPLAY_DC = 17;
+    constexpr uint8_t PIN_DISPLAY_RST = 16;
+    constexpr uint8_t PIN_DISPLAY_BUSY = 4;
+    constexpr uint8_t PIN_DISPLAY_SCLK = 18;
+    constexpr uint8_t PIN_DISPLAY_MOSI = 23;
+
+    // Configure SPI pins based on hardware
+    SPI.begin(PIN_DISPLAY_SCLK, -1, PIN_DISPLAY_MOSI, PIN_DISPLAY_CS);
 
     // Create display instance based on build environment dimensions
     // Automatically selects driver based on DISPLAY_WIDTH and DISPLAY_HEIGHT
@@ -2488,15 +2468,15 @@ void setup() {
             #ifdef DISPLAY_GDEW0213I5F
                 // 2.13" 4G (GDEW0213I5F) - UC8151/IL0373 controller, flexible
                 display = new GxEPD2_4G_4G<GxEPD2_213_flex, GxEPD2_213_flex::HEIGHT>(
-                    GxEPD2_213_flex(cfg.display.pins.cs, cfg.display.pins.dc,
-                                    cfg.display.pins.rst, cfg.display.pins.busy)
+                    GxEPD2_213_flex(PIN_DISPLAY_CS, PIN_DISPLAY_DC,
+                                    PIN_DISPLAY_RST, PIN_DISPLAY_BUSY)
                 );
                 logMessage(LOG_INFO, "DISPLAY", "Driver: 2.13\" 4G grayscale (GDEW0213I5F)");
             #else
                 // 2.13" 4G (GDEY0213B74 / GDEM0213B74)
                 display = new GxEPD2_4G_4G<GxEPD2_213_GDEY0213B74, GxEPD2_213_GDEY0213B74::HEIGHT>(
-                    GxEPD2_213_GDEY0213B74(cfg.display.pins.cs, cfg.display.pins.dc,
-                                            cfg.display.pins.rst, cfg.display.pins.busy)
+                    GxEPD2_213_GDEY0213B74(PIN_DISPLAY_CS, PIN_DISPLAY_DC,
+                                            PIN_DISPLAY_RST, PIN_DISPLAY_BUSY)
                 );
                 logMessage(LOG_INFO, "DISPLAY", "Driver: 2.13\" 4G grayscale (GDEY0213B74)");
             #endif
@@ -2506,31 +2486,31 @@ void setup() {
         #if defined(DISPLAY_WIDTH) && DISPLAY_WIDTH == 264 && defined(DISPLAY_HEIGHT) && DISPLAY_HEIGHT == 176
             // 2.7" BW (GDEY027T91)
             display = new GxEPD2_BW<GxEPD2_270, GxEPD2_270::HEIGHT>(
-                GxEPD2_270(cfg.display.pins.cs, cfg.display.pins.dc,
-                           cfg.display.pins.rst, cfg.display.pins.busy)
+                GxEPD2_270(PIN_DISPLAY_CS, PIN_DISPLAY_DC,
+                           PIN_DISPLAY_RST, PIN_DISPLAY_BUSY)
             );
             logMessage(LOG_INFO, "DISPLAY", "Driver: 2.7\" BW (GxEPD2_270)");
         #elif defined(DISPLAY_WIDTH) && DISPLAY_WIDTH == 212
             #ifdef DISPLAY_GDEW0213T5D
                 // 2.13" BW (GDEW0213T5D) - UC8151D controller
                 display = new GxEPD2_BW<GxEPD2_213_T5D, GxEPD2_213_T5D::HEIGHT>(
-                    GxEPD2_213_T5D(cfg.display.pins.cs, cfg.display.pins.dc,
-                                   cfg.display.pins.rst, cfg.display.pins.busy)
+                    GxEPD2_213_T5D(PIN_DISPLAY_CS, PIN_DISPLAY_DC,
+                                   PIN_DISPLAY_RST, PIN_DISPLAY_BUSY)
                 );
                 logMessage(LOG_INFO, "DISPLAY", "Driver: 2.13\" BW (GxEPD2_213_T5D)");
             #else
                 // 2.13" BW (DEPG0213BN)
                 display = new GxEPD2_BW<GxEPD2_213_B74, GxEPD2_213_B74::HEIGHT>(
-                    GxEPD2_213_B74(cfg.display.pins.cs, cfg.display.pins.dc,
-                                   cfg.display.pins.rst, cfg.display.pins.busy)
+                    GxEPD2_213_B74(PIN_DISPLAY_CS, PIN_DISPLAY_DC,
+                                   PIN_DISPLAY_RST, PIN_DISPLAY_BUSY)
                 );
                 logMessage(LOG_INFO, "DISPLAY", "Driver: 2.13\" BW (GxEPD2_213_B74)");
             #endif
         #else
             // Default to 2.13" BW if dimensions not specified
             display = new GxEPD2_BW<GxEPD2_213_B74, GxEPD2_213_B74::HEIGHT>(
-                GxEPD2_213_B74(cfg.display.pins.cs, cfg.display.pins.dc,
-                               cfg.display.pins.rst, cfg.display.pins.busy)
+                GxEPD2_213_B74(PIN_DISPLAY_CS, PIN_DISPLAY_DC,
+                               PIN_DISPLAY_RST, PIN_DISPLAY_BUSY)
             );
             logMessage(LOG_INFO, "DISPLAY", "Driver: 2.13\" BW default (GxEPD2_213_B74)");
         #endif
@@ -2544,8 +2524,7 @@ void setup() {
     display->setRotation(cfg.display.rotation);
 
     char buf[128];
-    snprintf(buf, sizeof(buf), "width=%d height=%d rotation=%d",
-             cfg.display.width, cfg.display.height, cfg.display.rotation);
+    snprintf(buf, sizeof(buf), "rotation=%d", cfg.display.rotation);
     logMessage(LOG_INFO, "DISPLAY", "Initialized", buf);
 
     // Show boot screen only on power-on, not on wake from deep sleep
@@ -2575,7 +2554,7 @@ void setup() {
     }
 
     // Initialize resilience manager with heartbeat settings
-    ResilienceManager::init(cfg.timing.heartbeat_interval_ms, cfg.timing.heartbeat_timeout_ms);
+    ResilienceManager::init(ConnectionTiming::HEARTBEAT_INTERVAL_MS, ConnectionTiming::HEARTBEAT_TIMEOUT_MS);
     logMessage(LOG_INFO, "SYSTEM", "Resilience manager initialized");
 
     // Check power source at startup

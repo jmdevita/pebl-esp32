@@ -33,8 +33,17 @@ void OTAManager::parseServerUrl(String& host, uint16_t& port) {
 bool OTAManager::checkForUpdate(FirmwareInfo& info) {
     status = OTAStatus::CHECKING;
 
-    // Build request path with query parameters
-    String path = "/api/firmware/version?device_id=" + deviceId;
+    // Check if display_variant is configured (required for OTA)
+    String variant = ConfigManager::getDisplayVariant();
+    if (variant.isEmpty()) {
+        lastError = "display_variant not configured - OTA disabled";
+        status = OTAStatus::FAILED;
+        Serial.println("[OTA] display_variant not set in config.json - cannot check for updates");
+        return false;
+    }
+
+    // Build request path with query parameters including display_variant
+    String path = "/api/firmware/version?device_id=" + deviceId + "&display_variant=" + variant;
 
     // Parse serverUrl to extract host and port
     String host;
@@ -124,8 +133,8 @@ bool OTAManager::checkForUpdate(FirmwareInfo& info) {
 
     // Log update details
     String current = doc["current_version"] | "unknown";
-    Serial.printf("[OTA] Update available: %s → %s (%d bytes)\n",
-                  current.c_str(), info.version.c_str(), info.size);
+    Serial.printf("[OTA] Update available: %s → %s (%d bytes) [variant: %s]\n",
+                  current.c_str(), info.version.c_str(), info.size, variant.c_str());
 
     if (info.required) {
         Serial.println("[OTA] This is a required update");
@@ -140,8 +149,16 @@ bool OTAManager::downloadAndInstall(const FirmwareInfo& info,
                                    void (*progressCallback)(size_t, size_t)) {
     status = OTAStatus::DOWNLOADING;
 
-    // Build download path with query parameters
-    String path = info.downloadUrl + "?device_id=" + deviceId;
+    // Get display_variant (same as in checkForUpdate)
+    String variant = ConfigManager::getDisplayVariant();
+    if (variant.isEmpty()) {
+        lastError = "display_variant not configured";
+        status = OTAStatus::FAILED;
+        return false;
+    }
+
+    // Build download path with query parameters including display_variant
+    String path = info.downloadUrl + "?device_id=" + deviceId + "&display_variant=" + variant;
 
     // Parse serverUrl to extract host and port
     String host;

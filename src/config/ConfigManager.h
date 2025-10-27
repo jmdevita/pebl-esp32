@@ -11,17 +11,16 @@ struct AppConfig {
     struct {
         String id;
         String name;
+        String display_variant;  // Platformio environment name (e.g., "lilygo_t5_gdew_4g")
     } device;
 
     // WiFi settings
+    // Note: WiFi credentials (SSID/password) are stored in ESP32 NVS by WiFiManager
+    // and do not need to be in config.json. Provisioning mode handles credential management.
     struct {
-        String ssid;
-        String password;
         uint32_t timeout_ms;
-        uint32_t reconnect_interval_ms;
-        // Adaptive TX power settings
-        bool adaptive_tx_power;          // Enable/disable adaptive power management
-        String force_tx_power;           // Override: "LOW", "MEDIUM", "HIGH", or empty
+        // TX power settings
+        bool force_high_power;           // true = always use HIGH (19.5dBm), false = adaptive LOW→MEDIUM→HIGH
         uint8_t escalation_threshold;    // Failures before escalating power (default: 3)
         uint8_t max_failed_wakes;        // Failed wakes before fallback mode (default: 20)
     } wifi;
@@ -35,27 +34,14 @@ struct AppConfig {
     } server;
 
     // Display settings
+    // Note: Display width/height and pins are set at compile-time via platformio.ini build flags
+    // Pins are hardware-specific and cannot be changed without rewiring
     struct {
-        uint16_t width;
-        uint16_t height;
         uint8_t rotation;
-        struct {
-            uint8_t cs;
-            uint8_t dc;
-            uint8_t rst;
-            uint8_t busy;
-            uint8_t sclk;
-            uint8_t mosi;
-        } pins;
     } display;
 
-    // Timing settings
-    struct {
-        uint32_t heartbeat_interval_ms;
-        uint32_t heartbeat_timeout_ms;
-        uint32_t ws_initial_reconnect_ms;
-        uint32_t ws_max_reconnect_ms;
-    } timing;
+    // Note: Connection timing settings are hardcoded to match server protocol
+    // and should not be user-configurable to prevent connection issues
 
     // Security settings
     struct {
@@ -64,11 +50,10 @@ struct AppConfig {
     } security;
 
     // Power management settings
+    // Note: Battery pin is hardcoded to GPIO 35, USB voltage thresholds are constants
     struct {
         bool sleep_enabled;
         uint8_t sleep_duration_min;
-        uint8_t battery_pin;
-        float usb_threshold_v;
     } power;
 
     // Logging settings
@@ -78,10 +63,9 @@ struct AppConfig {
     } logging;
 
     // Timezone settings
+    // Note: API URL and key are hardcoded in firmware (no user configuration needed)
     struct {
         uint8_t sync_interval_hours;  // How often to re-sync (default: 24)
-        String api_url;                // Timezone API base URL
-        String api_key;                // API key for timezone service
     } timezone;
 
     // Quiet hours settings
@@ -118,10 +102,9 @@ public:
     
     // Helper methods for common access patterns
     static String getDeviceId() { return config.device.id; }
-    static String getWiFiSSID() { return config.wifi.ssid; }
-    static String getWiFiPassword() { return config.wifi.password; }
     static String getServerHost() { return config.server.host; }
     static uint16_t getServerPort() { return config.server.port; }
+    static String getDisplayVariant() { return config.device.display_variant; }
     
     // For testing - allows injecting JSON config
     static bool loadFromJson(const String& json);

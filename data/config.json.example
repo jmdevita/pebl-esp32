@@ -1,18 +1,16 @@
 {
   "device": {
     "id": "esp32_device_001",
-    "name": "My E-Paper Display"
+    "name": "My E-Paper Display",
+    "display_variant": "YOUR_PLATFORMIO_ENV_NAME",
+    "_comment": "display_variant REQUIRED for OTA updates. Must match your compiled firmware environment. Valid values: lilygo_t5_depg_bw (BW default), lilygo_t5_gdew_bw (BW), lilygo_t5_gdem_4g (4G grayscale), lilygo_t5_gdew_4g (4G grayscale), lilygo_t5_gdey_4g (4G fast), lilygo_t5_v231 (legacy BW), lilygo_t5_213 (legacy BW), lilygo_t5s_27 (legacy 2.7\" BW). See platformio.ini [env:xxx] sections."
   },
   "wifi": {
-    "ssid": "YOUR_WIFI_SSID",
-    "password": "YOUR_WIFI_PASSWORD",
     "timeout_ms": 20000,
-    "reconnect_interval_ms": 30000,
-    "adaptive_tx_power": true,
-    "force_tx_power": "",
+    "force_high_power": false,
     "escalation_threshold": 3,
     "max_failed_wakes": 20,
-    "_comment": "Adaptive TX power: Starts at LOW (11dBm) for ~40% WiFi battery savings. Auto-escalates to MEDIUM/HIGH if connection fails. Use force_tx_power to override (LOW/MEDIUM/HIGH). After 20 failed wakes, enters low-power fallback mode (60min sleep, retries every 6h). RSSI guide: >-60dBm=Excellent (use LOW), -60 to -70=Good (MEDIUM), <-70=Fair (HIGH)."
+    "_comment": "TX power: By default (false), uses adaptive mode starting at LOW (11dBm) for ~40% WiFi battery savings, auto-escalating to MEDIUM/HIGH if connection fails. Set true to always use HIGH (19.5dBm). After 20 failed wakes, enters low-power fallback mode (60min sleep, retries every 6h)."
   },
   "server": {
     "host": "YOUR_SERVER_URL",
@@ -21,23 +19,7 @@
     "use_ssl": true
   },
   "display": {
-    "width": 212,
-    "height": 104,
-    "rotation": 1,
-    "pins": {
-      "cs": 5,
-      "dc": 17,
-      "rst": 16,
-      "busy": 4,
-      "sclk": 18,
-      "mosi": 23
-    }
-  },
-  "timing": {
-    "heartbeat_interval_ms": 15000,
-    "heartbeat_timeout_ms": 30000,
-    "ws_initial_reconnect_ms": 15000,
-    "ws_max_reconnect_ms": 60000
+    "rotation": 1
   },
   "security": {
     "use_aes": true,
@@ -45,18 +27,14 @@
   },
   "power": {
     "sleep_enabled": true,
-    "sleep_duration_min": 1,
-    "battery_pin": 35,
-    "usb_threshold_v": 4.3
+    "sleep_duration_min": 1
   },
   "logging": {
     "default_level": "WARN",
     "enable_test_commands": false
   },
   "timezone": {
-    "sync_interval_hours": 24,
-    "api_url": "https://api.ipgeolocation.io/timezone",
-    "api_key": "123456"
+    "sync_interval_hours": 24
   },
   "quiet_hours": {
     "start_hour": 23,

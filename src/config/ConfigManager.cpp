@@ -22,15 +22,12 @@ void ConfigManager::setDefaults() {
     // Device defaults
     config.device.id = "esp32-default";
     config.device.name = "ESP32 Device";
+    config.device.display_variant = "";  // Must be set in config.json for OTA updates
 
     // WiFi defaults
-    config.wifi.ssid = "";
-    config.wifi.password = "";
     config.wifi.timeout_ms = 15000;
-    config.wifi.reconnect_interval_ms = 30000;
-    // Adaptive TX power defaults
-    config.wifi.adaptive_tx_power = true;
-    config.wifi.force_tx_power = "";
+    // TX power defaults
+    config.wifi.force_high_power = false;  // Use adaptive power by default
     config.wifi.escalation_threshold = 3;
     config.wifi.max_failed_wakes = 20;
 
@@ -41,21 +38,7 @@ void ConfigManager::setDefaults() {
     config.server.use_ssl = true;
 
     // Display defaults for T5 V2.3.1
-    config.display.width = 250;
-    config.display.height = 122;
     config.display.rotation = 1;
-    config.display.pins.cs = 5;
-    config.display.pins.dc = 17;
-    config.display.pins.rst = 16;
-    config.display.pins.busy = 4;
-    config.display.pins.sclk = 18;
-    config.display.pins.mosi = 23;
-
-    // Timing defaults
-    config.timing.heartbeat_interval_ms = 15000;
-    config.timing.heartbeat_timeout_ms = 30000;
-    config.timing.ws_initial_reconnect_ms = 15000;
-    config.timing.ws_max_reconnect_ms = 60000;
 
     // Security defaults
     config.security.use_aes = false;
@@ -64,8 +47,6 @@ void ConfigManager::setDefaults() {
     // Power defaults
     config.power.sleep_enabled = true;
     config.power.sleep_duration_min = 1;
-    config.power.battery_pin = 35;
-    config.power.usb_threshold_v = 4.3;
 
     // Logging defaults
     config.logging.default_level = "WARN";
@@ -73,8 +54,6 @@ void ConfigManager::setDefaults() {
 
     // Timezone defaults
     config.timezone.sync_interval_hours = 24;
-    config.timezone.api_url = "https://api.ipgeolocation.io/timezone";
-    config.timezone.api_key = "420755f05aa14c8f96f8dae5d8176022";  // IPGeolocation.io free tier
 
     // Quiet hours defaults
     config.quiet_hours.start_hour = 23;  // 11 PM
@@ -156,18 +135,15 @@ bool ConfigManager::loadFromJson(const String& jsonStr) {
         JsonObject device = doc["device"];
         config.device.id = device["id"] | config.device.id;
         config.device.name = device["name"] | config.device.name;
+        config.device.display_variant = device["display_variant"] | config.device.display_variant;
     }
 
     // Parse WiFi section
     if (doc["wifi"].is<JsonObject>()) {
         JsonObject wifi = doc["wifi"];
-        config.wifi.ssid = wifi["ssid"] | config.wifi.ssid;
-        config.wifi.password = wifi["password"] | config.wifi.password;
         config.wifi.timeout_ms = wifi["timeout_ms"] | config.wifi.timeout_ms;
-        config.wifi.reconnect_interval_ms = wifi["reconnect_interval_ms"] | config.wifi.reconnect_interval_ms;
-        // Adaptive TX power settings
-        config.wifi.adaptive_tx_power = wifi["adaptive_tx_power"] | config.wifi.adaptive_tx_power;
-        config.wifi.force_tx_power = wifi["force_tx_power"] | config.wifi.force_tx_power;
+        // TX power settings
+        config.wifi.force_high_power = wifi["force_high_power"] | config.wifi.force_high_power;
         config.wifi.escalation_threshold = wifi["escalation_threshold"] | config.wifi.escalation_threshold;
         config.wifi.max_failed_wakes = wifi["max_failed_wakes"] | config.wifi.max_failed_wakes;
     }
@@ -184,28 +160,7 @@ bool ConfigManager::loadFromJson(const String& jsonStr) {
     // Parse display section
     if (doc["display"].is<JsonObject>()) {
         JsonObject display = doc["display"];
-        config.display.width = display["width"] | config.display.width;
-        config.display.height = display["height"] | config.display.height;
         config.display.rotation = display["rotation"] | config.display.rotation;
-
-        if (display["pins"].is<JsonObject>()) {
-            JsonObject pins = display["pins"];
-            config.display.pins.cs = pins["cs"] | config.display.pins.cs;
-            config.display.pins.dc = pins["dc"] | config.display.pins.dc;
-            config.display.pins.rst = pins["rst"] | config.display.pins.rst;
-            config.display.pins.busy = pins["busy"] | config.display.pins.busy;
-            config.display.pins.sclk = pins["sclk"] | config.display.pins.sclk;
-            config.display.pins.mosi = pins["mosi"] | config.display.pins.mosi;
-        }
-    }
-
-    // Parse timing section
-    if (doc["timing"].is<JsonObject>()) {
-        JsonObject timing = doc["timing"];
-        config.timing.heartbeat_interval_ms = timing["heartbeat_interval_ms"] | config.timing.heartbeat_interval_ms;
-        config.timing.heartbeat_timeout_ms = timing["heartbeat_timeout_ms"] | config.timing.heartbeat_timeout_ms;
-        config.timing.ws_initial_reconnect_ms = timing["ws_initial_reconnect_ms"] | config.timing.ws_initial_reconnect_ms;
-        config.timing.ws_max_reconnect_ms = timing["ws_max_reconnect_ms"] | config.timing.ws_max_reconnect_ms;
     }
 
     // Parse security section
@@ -220,8 +175,6 @@ bool ConfigManager::loadFromJson(const String& jsonStr) {
         JsonObject power = doc["power"];
         config.power.sleep_enabled = power["sleep_enabled"] | config.power.sleep_enabled;
         config.power.sleep_duration_min = power["sleep_duration_min"] | config.power.sleep_duration_min;
-        config.power.battery_pin = power["battery_pin"] | config.power.battery_pin;
-        config.power.usb_threshold_v = power["usb_threshold_v"] | config.power.usb_threshold_v;
     }
 
     // Parse logging section
@@ -235,8 +188,6 @@ bool ConfigManager::loadFromJson(const String& jsonStr) {
     if (doc["timezone"].is<JsonObject>()) {
         JsonObject timezone = doc["timezone"];
         config.timezone.sync_interval_hours = timezone["sync_interval_hours"] | config.timezone.sync_interval_hours;
-        config.timezone.api_url = timezone["api_url"] | config.timezone.api_url;
-        config.timezone.api_key = timezone["api_key"] | config.timezone.api_key;
     }
 
     // Parse quiet_hours section
@@ -254,13 +205,20 @@ bool ConfigManager::loadFromJson(const String& jsonStr) {
     }
 
     loaded = true;
+
+    // Validate display_variant is set (required for OTA updates)
+    if (config.device.display_variant.isEmpty()) {
+        logMessage("WARN", "CONFIG", "display_variant not set - OTA updates will be disabled");
+        logMessage("WARN", "CONFIG", "Add display_variant to config.json to enable OTA (see config.json.example)");
+    }
+
     logMessage("INFO", "CONFIG", "Configuration loaded successfully");
-    
+
     // Log key config values for debugging
     char buf[256];
-    snprintf(buf, sizeof(buf), "device_id=%s wifi_ssid=%s server=%s:%d",
-             config.device.id.c_str(), config.wifi.ssid.c_str(),
-             config.server.host.c_str(), config.server.port);
+    snprintf(buf, sizeof(buf), "device_id=%s server=%s:%d variant=%s",
+             config.device.id.c_str(), config.server.host.c_str(), config.server.port,
+             config.device.display_variant.c_str());
     logMessage("DEBUG", "CONFIG", "Loaded values", buf);
 
     return true;
@@ -293,15 +251,12 @@ String ConfigManager::toJson() {
     JsonObject device = doc["device"].to<JsonObject>();
     device["id"] = config.device.id;
     device["name"] = config.device.name;
+    device["display_variant"] = config.device.display_variant;
 
     // WiFi section
     JsonObject wifi = doc["wifi"].to<JsonObject>();
-    wifi["ssid"] = config.wifi.ssid;
-    wifi["password"] = config.wifi.password;
     wifi["timeout_ms"] = config.wifi.timeout_ms;
-    wifi["reconnect_interval_ms"] = config.wifi.reconnect_interval_ms;
-    wifi["adaptive_tx_power"] = config.wifi.adaptive_tx_power;
-    wifi["force_tx_power"] = config.wifi.force_tx_power;
+    wifi["force_high_power"] = config.wifi.force_high_power;
     wifi["escalation_threshold"] = config.wifi.escalation_threshold;
     wifi["max_failed_wakes"] = config.wifi.max_failed_wakes;
 
@@ -314,24 +269,7 @@ String ConfigManager::toJson() {
 
     // Display section
     JsonObject display = doc["display"].to<JsonObject>();
-    display["width"] = config.display.width;
-    display["height"] = config.display.height;
     display["rotation"] = config.display.rotation;
-
-    JsonObject pins = display["pins"].to<JsonObject>();
-    pins["cs"] = config.display.pins.cs;
-    pins["dc"] = config.display.pins.dc;
-    pins["rst"] = config.display.pins.rst;
-    pins["busy"] = config.display.pins.busy;
-    pins["sclk"] = config.display.pins.sclk;
-    pins["mosi"] = config.display.pins.mosi;
-
-    // Timing section
-    JsonObject timing = doc["timing"].to<JsonObject>();
-    timing["heartbeat_interval_ms"] = config.timing.heartbeat_interval_ms;
-    timing["heartbeat_timeout_ms"] = config.timing.heartbeat_timeout_ms;
-    timing["ws_initial_reconnect_ms"] = config.timing.ws_initial_reconnect_ms;
-    timing["ws_max_reconnect_ms"] = config.timing.ws_max_reconnect_ms;
 
     // Security section
     JsonObject security = doc["security"].to<JsonObject>();
@@ -346,8 +284,6 @@ String ConfigManager::toJson() {
     // Timezone section
     JsonObject timezone = doc["timezone"].to<JsonObject>();
     timezone["sync_interval_hours"] = config.timezone.sync_interval_hours;
-    timezone["api_url"] = config.timezone.api_url;
-    timezone["api_key"] = config.timezone.api_key;
 
     // Quiet hours section
     JsonObject quiet_hours = doc["quiet_hours"].to<JsonObject>();
