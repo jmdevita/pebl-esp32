@@ -110,9 +110,6 @@ private:
     OTAStatus status;
     String lastError;
 
-    HTTPClient httpClient;
-    WiFiClientSecure secureClient;
-
     // ECDSA P-256 public key for firmware signature verification
     // Generated using scripts/generate_ota_keys.sh
     // Fingerprint: 882517373e7bac2b9f552445d3f8269f15a35998a4c7f52866cd56810620d752
@@ -122,7 +119,4 @@ MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEpaUoIStuizMGtDR9hJ7SeY8gX9m4
 2frDuv7haRz+O67nPYZ/VxMc5R/q4spN3bk315CnIOChSx18gUFoYQ7HFQ==
 -----END PUBLIC KEY-----
 )";
-
-    // Helper to parse serverUrl into host and port
-    void parseServerUrl(String& host, uint16_t& port);
 };

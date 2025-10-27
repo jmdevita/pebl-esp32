@@ -65,21 +65,21 @@ void ConfigManager::setDefaults() {
 }
 
 bool ConfigManager::begin() {
-    logMessage("INFO", "CONFIG", "Initializing SPIFFS");
+    logMessage("INFO", "CONFIG", "Initializing LittleFS");
 
-    if (!SPIFFS.begin(true)) {
-        logMessage("ERROR", "CONFIG", "Failed to mount SPIFFS");
+    if (!LittleFS.begin(true)) {
+        logMessage("ERROR", "CONFIG", "Failed to mount LittleFS");
         return false;
     }
 
-    // Check SPIFFS size
-    size_t totalBytes = SPIFFS.totalBytes();
-    size_t usedBytes = SPIFFS.usedBytes();
-    
+    // Check LittleFS size
+    size_t totalBytes = LittleFS.totalBytes();
+    size_t usedBytes = LittleFS.usedBytes();
+
     char buf[128];
-    snprintf(buf, sizeof(buf), "total=%u used=%u free=%u", 
+    snprintf(buf, sizeof(buf), "total=%u used=%u free=%u",
              totalBytes, usedBytes, totalBytes - usedBytes);
-    logMessage("INFO", "CONFIG", "SPIFFS mounted", buf);
+    logMessage("INFO", "CONFIG", "LittleFS mounted", buf);
 
     return load();
 }
@@ -91,14 +91,14 @@ bool ConfigManager::load() {
     setDefaults();
 
     // Check if config file exists
-    if (!SPIFFS.exists(CONFIG_FILE)) {
+    if (!LittleFS.exists(CONFIG_FILE)) {
         logMessage("WARN", "CONFIG", "Config file not found, using defaults");
         loaded = true;  // Defaults are valid
         return true;
     }
 
     // Open the file
-    File file = SPIFFS.open(CONFIG_FILE, "r");
+    File file = LittleFS.open(CONFIG_FILE, "r");
     if (!file) {
         logMessage("ERROR", "CONFIG", "Failed to open config file");
         return false;
@@ -227,7 +227,7 @@ bool ConfigManager::loadFromJson(const String& jsonStr) {
 bool ConfigManager::save() {
     logMessage("INFO", "CONFIG", "Saving configuration");
 
-    File file = SPIFFS.open(CONFIG_FILE, "w");
+    File file = LittleFS.open(CONFIG_FILE, "w");
     if (!file) {
         logMessage("ERROR", "CONFIG", "Failed to create config file");
         return false;

@@ -5,29 +5,8 @@ OTAManager::OTAManager(const String& serverUrl, const String& deviceId)
     : serverUrl(serverUrl), deviceId(deviceId), status(OTAStatus::IDLE) {
 
     // Get current version from app descriptor
-    const esp_app_desc_t* app_desc = esp_ota_get_app_description();
+    const esp_app_desc_t* app_desc = esp_app_get_description();
     currentVersion = String(app_desc->version);
-
-    // Configure HTTPS (server is always HTTPS)
-    // Uses standard certificate validation like WebSocket
-    // FUTURE: Add certificate pinning for enhanced security
-    Serial.println("[OTA] Configuring HTTPS");
-    secureClient.setInsecure();
-    Serial.println("[OTA] HTTPS enabled");
-}
-
-// Helper method to parse serverUrl into host and port components
-// Assumes serverUrl format: "https://example.com" or "https://example.com:443"
-void OTAManager::parseServerUrl(String& host, uint16_t& port) {
-    host = serverUrl;
-    host.remove(0, 8);  // Remove "https://"
-
-    port = 443;  // Default HTTPS port
-    int portIndex = host.indexOf(':');
-    if (portIndex > 0) {
-        port = host.substring(portIndex + 1).toInt();
-        host = host.substring(0, portIndex);
-    }
 }
 
 bool OTAManager::checkForUpdate(FirmwareInfo& info) {
@@ -42,17 +21,34 @@ bool OTAManager::checkForUpdate(FirmwareInfo& info) {
         return false;
     }
 
-    // Build request path with query parameters including display_variant
-    String path = "/api/firmware/version?device_id=" + deviceId + "&display_variant=" + variant;
+    // Build full URL with query parameters including display_variant
+    String url = serverUrl + "/api/firmware/version?device_id=" + deviceId + "&display_variant=" + variant;
 
-    // Parse serverUrl to extract host and port
-    String host;
-    uint16_t port;
-    parseServerUrl(host, port);
+    // Create fresh HTTPS client instances
+    WiFiClientSecure secureClient;
+    HTTPClient httpClient;
 
-    // Use explicit begin() signature to prevent URL parsing issues
-    // Only the hostname is passed to DNS resolver, not the full URL
-    httpClient.begin(secureClient, host, port, path);
+    // WORKAROUND: Skip certificate validation for Cloudflare tunnel
+    //
+    // Root cause: Server uses ECDSA certificates via Cloudflare tunnel, which causes
+    // mbedTLS certificate chain validation to fail with error -12288 (X509 verification failed).
+    // The timezone API (ipgeolocation.io) uses RSA certificates and validates successfully.
+    //
+    // Investigation showed:
+    // - OTA server: EC P-256 keys, Google Trust Services WE1 intermediate, 3-cert chain
+    // - Timezone API: RSA 2048 keys, Let's Encrypt R11 intermediate, 2-cert chain
+    // - Desktop browsers and curl validate both chains successfully
+    // - ESP32 mbedTLS validates RSA chain but fails on ECDSA chain
+    //
+    // Connection is still encrypted with TLS 1.3, just without certificate validation.
+    // This matches WebSocket behavior which uses beginSSL() without validation.
+    //
+    // FUTURE: Investigate proper fix - see docs/SSL_CERT_VALIDATION_ISSUE.md
+    // Options: 1) Update mbedTLS config for ECDSA, 2) Force Cloudflare to use RSA certs
+    secureClient.setInsecure();
+    Serial.println("[OTA] Skipping cert check (encrypted + signed, trusted network)");
+
+    httpClient.begin(secureClient, url);
 
     // FUTURE: OTA API authentication not yet implemented
     // When added, enable this to require Bearer token for firmware downloads:
@@ -157,17 +153,20 @@ bool OTAManager::downloadAndInstall(const FirmwareInfo& info,
         return false;
     }
 
-    // Build download path with query parameters including display_variant
-    String path = info.downloadUrl + "?device_id=" + deviceId + "&display_variant=" + variant;
+    // Build full download URL with query parameters including display_variant
+    // IMPORTANT: Must use full URL (with https://) for certificate validation to work
+    String url = serverUrl + info.downloadUrl + "?device_id=" + deviceId + "&display_variant=" + variant;
 
-    // Parse serverUrl to extract host and port
-    String host;
-    uint16_t port;
-    parseServerUrl(host, port);
+    // Create fresh HTTPS client instances
+    WiFiClientSecure secureClient;
+    HTTPClient httpClient;
 
-    // Use explicit begin() signature to prevent URL parsing issues
-    // Only the hostname is passed to DNS resolver, not the full URL
-    httpClient.begin(secureClient, host, port, path);
+    // WORKAROUND: Skip certificate validation (same as checkForUpdate)
+    // See docs/SSL_CERT_VALIDATION_ISSUE.md for details on ECDSA validation failure
+    secureClient.setInsecure();
+    Serial.println("[OTA] Skipping cert check (encrypted + signed, trusted network)");
+
+    httpClient.begin(secureClient, url);
 
     // FUTURE: OTA API authentication not yet implemented
     // When added, enable this to require Bearer token for firmware downloads:
@@ -194,7 +193,7 @@ bool OTAManager::downloadAndInstall(const FirmwareInfo& info,
     }
 
     // Get stream
-    WiFiClient* stream = httpClient.getStreamPtr();
+    NetworkClient* stream = httpClient.getStreamPtr();
 
     // Verify hash during download
     status = OTAStatus::VERIFYING;

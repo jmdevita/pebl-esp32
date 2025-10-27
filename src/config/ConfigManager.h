@@ -3,7 +3,7 @@
 
 #include <Arduino.h>
 #include <ArduinoJson.h>
-#include <SPIFFS.h>
+#include <LittleFS.h>
 
 // Configuration structure to hold all settings
 struct AppConfig {

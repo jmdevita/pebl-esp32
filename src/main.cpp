@@ -32,7 +32,7 @@
 #include <driver/adc.h>
 #include <HTTPClient.h>
 #include <PNGdec.h>
-#include <SPIFFS.h>
+#include <LittleFS.h>
 #include <time.h>  // For time_t, struct tm, gmtime()
 #include "ota/OTAManager.h"
 
@@ -112,7 +112,7 @@ void logMessage(int level, const char* module, const char* message, const char* 
 }
 
 // ============================================================================
-// Configuration - Now loaded from SPIFFS via ConfigManager
+// Configuration - Now loaded from LittleFS via ConfigManager
 // ============================================================================
 // Display text limits (keeping as constexpr since they're compile-time UI constants)
 namespace DisplayLimits {
@@ -457,13 +457,25 @@ public:
 
 private:
     static bool downloadEmoji(const char* url) {
+        // Log the URL being downloaded for debugging certificate issues
+        char urlBuf[128];
+        snprintf(urlBuf, sizeof(urlBuf), "url=%.120s", url);
+        logMessage(LOG_DEBUG, "EMOJI", "Downloading emoji", urlBuf);
+
+        // Configure HTTPS with Mozilla CA certificate bundle (covers all Slack CDN domains)
+        WiFiClientSecure secureClient;
+        extern const uint8_t rootca_crt_bundle_start[] asm("_binary_certs_x509_crt_bundle_bin_start");
+        extern const uint8_t rootca_crt_bundle_end[] asm("_binary_certs_x509_crt_bundle_bin_end");
+        size_t bundle_size = rootca_crt_bundle_end - rootca_crt_bundle_start;
+        secureClient.setCACertBundle(rootca_crt_bundle_start, bundle_size);
+
         HTTPClient http;
         http.setConnectTimeout(5000);  // 5 second timeout
         http.setTimeout(10000);         // 10 second total timeout
         http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
 
-        if (!http.begin(url)) {
-            logMessage(LOG_ERROR, "EMOJI", "HTTP begin failed");
+        if (!http.begin(secureClient, url)) {
+            logMessage(LOG_ERROR, "EMOJI", "HTTPS begin failed");
             return false;
         }
 
@@ -539,6 +551,19 @@ private:
             free(downloadBuffer);
             downloadBuffer = nullptr;
             return false;  // Don't process incomplete data
+        }
+
+        // Validate PNG file format (magic bytes: 0x89 PNG \r \n 0x1a \n)
+        // Protects against malformed or malicious files from compromised CDN
+        if (downloadSize < 8 ||
+            downloadBuffer[0] != 0x89 || downloadBuffer[1] != 0x50 ||
+            downloadBuffer[2] != 0x4E || downloadBuffer[3] != 0x47 ||
+            downloadBuffer[4] != 0x0D || downloadBuffer[5] != 0x0A ||
+            downloadBuffer[6] != 0x1A || downloadBuffer[7] != 0x0A) {
+            logMessage(LOG_ERROR, "EMOJI", "Invalid PNG file (bad magic bytes)");
+            free(downloadBuffer);
+            downloadBuffer = nullptr;
+            return false;
         }
 
         return true;
@@ -1153,18 +1178,37 @@ bool fetchTimezoneFromAPI() {
     constexpr const char* TIMEZONE_API_URL = "https://api.ipgeolocation.io/timezone";
     constexpr const char* TIMEZONE_API_KEY = "420755f05aa14c8f96f8dae5d8176022";
 
+    logMessage(LOG_DEBUG, "TIME", "Starting timezone fetch");
+
+    // Configure HTTPS with Mozilla CA certificate bundle (146 root CAs)
+    WiFiClientSecure secureClient;
+    logMessage(LOG_DEBUG, "TIME", "Created WiFiClientSecure");
+
+    // Access embedded certificate bundle
+    extern const uint8_t rootca_crt_bundle_start[] asm("_binary_certs_x509_crt_bundle_bin_start");
+    extern const uint8_t rootca_crt_bundle_end[] asm("_binary_certs_x509_crt_bundle_bin_end");
+    size_t bundle_size = rootca_crt_bundle_end - rootca_crt_bundle_start;
+    secureClient.setCACertBundle(rootca_crt_bundle_start, bundle_size);
+    logMessage(LOG_DEBUG, "TIME", "Certificate bundle configured (146 CAs)");
+
     HTTPClient http;
-    http.setTimeout(5000);  // 5 second timeout
+    http.setTimeout(10000);  // 10 second timeout (increased from 5s)
+    logMessage(LOG_DEBUG, "TIME", "HTTPClient created");
 
     // Build URL with API key
     String url = String(TIMEZONE_API_URL) + "?apiKey=" + TIMEZONE_API_KEY;
-    http.begin(url);
+    logMessage(LOG_DEBUG, "TIME", "Starting HTTPS connection");
+
+    http.begin(secureClient, url);
+    logMessage(LOG_DEBUG, "TIME", "HTTPS connection established");
 
     char logBuf[128];
     snprintf(logBuf, sizeof(logBuf), "url=%s", TIMEZONE_API_URL);
     logMessage(LOG_INFO, "TIME", "Fetching timezone from API", logBuf);
 
+    logMessage(LOG_DEBUG, "TIME", "Sending GET request");
     int httpCode = http.GET();
+    logMessage(LOG_DEBUG, "TIME", "GET request completed");
 
     if (httpCode == 200) {
         String response = http.getString();
@@ -1838,9 +1882,9 @@ void processSerialCommand(const String& command) {
     }
     else if (command.startsWith("TEST:CONFIG:SAVE")) {
         if (ConfigManager::save()) {
-            logMessage(LOG_TEST, "CONFIG", "Configuration saved to SPIFFS");
+            logMessage(LOG_TEST, "CONFIG", "Configuration saved to LittleFS");
 
-            File f = SPIFFS.open("/config.json", "r");
+            File f = LittleFS.open("/config.json", "r");
             if (f) {
                 char buf[64];
                 snprintf(buf, sizeof(buf), "size=%d bytes", f.size());
@@ -2059,7 +2103,7 @@ void injectTestMessage(const String& jsonPayload) {
 // ============================================================================
 // Network Management
 // ============================================================================
-class NetworkManager {
+class SlackNetworkManager {
 public:
     static bool connectWiFi(bool silent = false) {
         const AppConfig& cfg = ConfigManager::getConfig();
@@ -2608,7 +2652,7 @@ void setup() {
     delay(500);
 
     // Connect to WiFi (silent mode on wake from sleep to skip connection screens)
-    if (NetworkManager::connectWiFi(isWakeFromSleep)) {
+    if (SlackNetworkManager::connectWiFi(isWakeFromSleep)) {
         // On wake from sleep: conditionally refresh display based on config
         if (isWakeFromSleep) {
             logMessage(LOG_INFO, "DISPLAY", "Wake from sleep - checking display update policy");
@@ -2725,6 +2769,11 @@ void setup() {
             }
         }
 
+        // DNS stabilization: After WiFi connection, DNS resolver needs time to initialize
+        // HTTPS requests (especially SSL handshake) will fail if DNS isn't ready
+        logMessage(LOG_DEBUG, "NETWORK", "Waiting for DNS resolver to stabilize");
+        delay(2000);  // 2 seconds for DNS to fully initialize
+
         // Timezone sync logic (after WiFi connected)
         bool isPowerOnBoot = (wakeup_reason == ESP_SLEEP_WAKEUP_UNDEFINED);
 
@@ -2775,7 +2824,7 @@ void setup() {
 
         // Small delay before WebSocket connection
         delay(2000);
-        NetworkManager::connectWebSocket();
+        SlackNetworkManager::connectWebSocket();
 
         // Initialize OTA manager (requires network connectivity)
         logMessage(LOG_INFO, "OTA", "Initializing OTA manager");
@@ -2828,7 +2877,7 @@ void loop() {
     }
 
     // Handle reconnection logic
-    NetworkManager::handleReconnection();
+    SlackNetworkManager::handleReconnection();
 
     // Check connection health and process queued messages
     ResilienceManager::checkHealth();
