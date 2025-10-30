@@ -431,6 +431,26 @@ public:
             return false;
         }
 
+        // GIF to APNG conversion: Slack CDN serves APNG versions at same path with .png extension
+        // APNG format stores first frame as standard PNG, so PNGdec automatically extracts it
+        // This is perfect for e-paper displays which can't animate anyway
+        char modifiedUrl[256];
+        size_t urlLen = strlen(url);
+
+        if (urlLen > 4 && urlLen < sizeof(modifiedUrl) - 1) {
+            // Check if URL ends with .gif (case-insensitive)
+            if (url[urlLen-4] == '.' &&
+                tolower(url[urlLen-3]) == 'g' &&
+                tolower(url[urlLen-2]) == 'i' &&
+                tolower(url[urlLen-1]) == 'f') {
+                // Copy everything except "gif", then append "png"
+                strncpy(modifiedUrl, url, urlLen - 3);
+                strcpy(modifiedUrl + urlLen - 3, "png");
+                url = modifiedUrl;
+                logMessage(LOG_DEBUG, "EMOJI", "Converted GIF URL to PNG for APNG first-frame extraction");
+            }
+        }
+
         // Download PNG from URL
         if (!downloadEmoji(url)) {
             logMessage(LOG_ERROR, "EMOJI", "Failed to download emoji");
@@ -840,13 +860,12 @@ public:
                 emojiDownloaded = true;  // Mark as downloaded for this reaction
             }
 
-            // Text fallback for emoji if not rendered graphically
+            // Text fallback: display emoji text as-is (server already formats with colons)
+            // Server sends emoji field as ":emoji_name:" so no need to add extra colons
             if (!emojiRendered) {
                 display->setFont(&FreeSans12pt7b);
                 display->setCursor(10, 63);
-                display->print(":");
                 display->print(emoji);
-                display->print(":");
             }
 
             // Reaction details - using smart truncation to prevent text wrapping
