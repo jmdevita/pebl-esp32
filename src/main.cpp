@@ -431,26 +431,7 @@ public:
             return false;
         }
 
-        // GIF to APNG conversion: Slack CDN serves APNG versions at same path with .png extension
-        // APNG format stores first frame as standard PNG, so PNGdec automatically extracts it
-        // This is perfect for e-paper displays which can't animate anyway
-        char modifiedUrl[256];
-        size_t urlLen = strlen(url);
-
-        if (urlLen > 4 && urlLen < sizeof(modifiedUrl) - 1) {
-            // Check if URL ends with .gif (case-insensitive)
-            if (url[urlLen-4] == '.' &&
-                tolower(url[urlLen-3]) == 'g' &&
-                tolower(url[urlLen-2]) == 'i' &&
-                tolower(url[urlLen-1]) == 'f') {
-                // Copy everything except "gif", then append "png"
-                strncpy(modifiedUrl, url, urlLen - 3);
-                strcpy(modifiedUrl + urlLen - 3, "png");
-                url = modifiedUrl;
-                logMessage(LOG_DEBUG, "EMOJI", "Converted GIF URL to PNG for APNG first-frame extraction");
-            }
-        }
-
+        // Server handles GIF→PNG conversion, client just downloads whatever URL provided
         // Download PNG from URL
         if (!downloadEmoji(url)) {
             logMessage(LOG_ERROR, "EMOJI", "Failed to download emoji");
@@ -494,38 +475,78 @@ private:
         snprintf(urlBuf, sizeof(urlBuf), "url=%.120s", url);
         logMessage(LOG_DEBUG, "EMOJI", "Downloading emoji", urlBuf);
 
-        // Configure HTTPS with Mozilla CA certificate bundle (covers all Slack CDN domains)
-        WiFiClientSecure secureClient;
-        extern const uint8_t rootca_crt_bundle_start[] asm("_binary_certs_x509_crt_bundle_bin_start");
-        extern const uint8_t rootca_crt_bundle_end[] asm("_binary_certs_x509_crt_bundle_bin_end");
-        size_t bundle_size = rootca_crt_bundle_end - rootca_crt_bundle_start;
-        secureClient.setCACertBundle(rootca_crt_bundle_start, bundle_size);
-
-        HTTPClient http;
-        http.setConnectTimeout(5000);  // 5 second timeout
-        http.setTimeout(10000);         // 10 second total timeout
-        http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
-
-        if (!http.begin(secureClient, url)) {
-            logMessage(LOG_ERROR, "EMOJI", "HTTPS begin failed");
+        // Allocate WiFiClientSecure on heap to avoid stack overflow
+        // SSL contexts consume ~5-6KB which exceeds default Arduino loop stack (8KB)
+        WiFiClientSecure* secureClient = new WiFiClientSecure();
+        if (!secureClient) {
+            logMessage(LOG_ERROR, "EMOJI", "Failed to allocate SSL client");
             return false;
         }
 
-        int httpCode = http.GET();
+        // Determine if URL is from Slack CDN or our server
+        bool isSlackCDN = (strstr(url, "slack-edge.com") != nullptr ||
+                          strstr(url, "slack.com") != nullptr);
+
+        if (isSlackCDN) {
+            // Configure HTTPS with Mozilla CA certificate bundle (covers all Slack CDN domains)
+            extern const uint8_t rootca_crt_bundle_start[] asm("_binary_certs_x509_crt_bundle_bin_start");
+            extern const uint8_t rootca_crt_bundle_end[] asm("_binary_certs_x509_crt_bundle_bin_end");
+            size_t bundle_size = rootca_crt_bundle_end - rootca_crt_bundle_start;
+            secureClient->setCACertBundle(rootca_crt_bundle_start, bundle_size);
+            logMessage(LOG_DEBUG, "EMOJI", "Using CA bundle for Slack CDN");
+        } else {
+            // WORKAROUND: Skip certificate validation for server domain (same as OTA/WebSocket)
+            // See docs/SSL_CERT_VALIDATION_ISSUE.md for details on ECDSA validation failure
+            //
+            // Security rationale:
+            // - Connection is still encrypted with TLS 1.3 (not plaintext)
+            // - Server validates emoji source from authenticated Slack CDN
+            // - Client validates PNG magic bytes after download (prevents malformed data)
+            // - Low-value data (emoji images) on trusted home network
+            //
+            // This matches the security model used for OTA updates and WebSocket connections.
+            secureClient->setInsecure();
+            logMessage(LOG_DEBUG, "EMOJI", "Skipping cert check (encrypted + validated, trusted network)");
+        }
+
+        // Allocate HTTPClient on heap to avoid stack overflow
+        HTTPClient* http = new HTTPClient();
+        if (!http) {
+            logMessage(LOG_ERROR, "EMOJI", "Failed to allocate HTTP client");
+            delete secureClient;
+            return false;
+        }
+
+        http->setConnectTimeout(5000);  // 5 second timeout
+        http->setTimeout(10000);         // 10 second total timeout
+        http->setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+
+        if (!http->begin(*secureClient, url)) {
+            logMessage(LOG_ERROR, "EMOJI", "HTTPS begin failed");
+            delete http;
+            delete secureClient;
+            return false;
+        }
+
+        int httpCode = http->GET();
         if (httpCode != HTTP_CODE_OK) {
             char logBuf[64];
             snprintf(logBuf, sizeof(logBuf), "http_code=%d", httpCode);
             logMessage(LOG_ERROR, "EMOJI", "HTTP GET failed", logBuf);
-            http.end();
+            http->end();
+            delete http;
+            delete secureClient;
             return false;
         }
 
-        int len = http.getSize();
+        int len = http->getSize();
         if (len <= 0 || len > MAX_EMOJI_SIZE) {
             char logBuf[64];
             snprintf(logBuf, sizeof(logBuf), "invalid_size=%d", len);
             logMessage(LOG_ERROR, "EMOJI", "Invalid content size", logBuf);
-            http.end();
+            http->end();
+            delete http;
+            delete secureClient;
             return false;
         }
 
@@ -534,24 +555,28 @@ private:
         downloadBuffer = (uint8_t*)malloc(downloadCapacity);
         if (!downloadBuffer) {
             logMessage(LOG_ERROR, "EMOJI", "Failed to allocate download buffer");
-            http.end();
+            http->end();
+            delete http;
+            delete secureClient;
             return false;
         }
 
         // Read response into buffer with timeout protection
-        WiFiClient* stream = http.getStreamPtr();
+        WiFiClient* stream = http->getStreamPtr();
         if (!stream) {
             logMessage(LOG_ERROR, "EMOJI", "Failed to get stream pointer");
             free(downloadBuffer);
             downloadBuffer = nullptr;
-            http.end();
+            http->end();
+            delete http;
+            delete secureClient;
             return false;
         }
 
         downloadSize = 0;
         unsigned long downloadStart = millis();
 
-        while (http.connected() && downloadSize < downloadCapacity) {
+        while (http->connected() && downloadSize < downloadCapacity) {
             // Timeout check: 10 second maximum for download
             if ((unsigned long)(millis() - downloadStart) > 10000) {
                 char logBuf[64];
@@ -559,7 +584,9 @@ private:
                 logMessage(LOG_ERROR, "EMOJI", "Download timeout", logBuf);
                 free(downloadBuffer);
                 downloadBuffer = nullptr;
-                http.end();
+                http->end();
+                delete http;
+                delete secureClient;
                 return false;  // Timeout = failed download
             }
 
@@ -573,7 +600,9 @@ private:
             }
         }
 
-        http.end();
+        http->end();
+        delete http;
+        delete secureClient;
 
         // Verify we got complete download
         if (downloadSize != downloadCapacity) {
