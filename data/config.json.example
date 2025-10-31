@@ -22,8 +22,10 @@
     "rotation": 1
   },
   "security": {
+    "auth_token": "YOUR_AUTH_TOKEN_FROM_ADMIN_PANEL",
     "use_aes": true,
-    "aes_key": "YOUR_32_BYTE_HEX_AES_KEY_HERE"
+    "aes_key": "YOUR_32_BYTE_HEX_AES_KEY_HERE",
+    "_comment": "auth_token REQUIRED for device authentication (two-factor: device_id + token). Get from admin panel (/admin/tokens/generate)."
   },
   "power": {
     "sleep_enabled": true,

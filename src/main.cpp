@@ -1840,10 +1840,12 @@ void webSocketEvent(WStype_t type, uint8_t* payload, size_t length) {
             ResilienceManager::recordHeartbeat();  // Record initial heartbeat
             const AppConfig& cfg = ConfigManager::getConfig();
 
+            // Declare hexKey outside if block so it's accessible throughout the case
+            String hexKey = "";
+
             // Send registration message with AES key if encryption is enabled
             if (cfg.security.use_aes && !cfg.security.aes_key.isEmpty()) {
                 // Convert base64 key to hex for server
-                String hexKey = "";
                 size_t keyLen = 32;
                 unsigned char decodedKey[32];
                 size_t outLen;
@@ -1860,20 +1862,31 @@ void webSocketEvent(WStype_t type, uint8_t* payload, size_t length) {
                         snprintf(hexBuf, sizeof(hexBuf), "%02x", decodedKey[i]);
                         hexKey += hexBuf;
                     }
-
-                    // Send registration message
-                    JsonDocument regDoc;
-                    regDoc["device_type"] = "esp32_eink";
-                    regDoc["aes_key"] = hexKey;
-
-                    String regMsg;
-                    serializeJson(regDoc, regMsg);
-                    webSocket.sendTXT(regMsg);
-
-                    logMessage(LOG_INFO, "WS", "Sent AES registration");
                 } else {
                     logMessage(LOG_WARN, "WS", "Failed to decode AES key for registration");
                 }
+            }
+
+            // Send registration message with auth_token (mandatory two-factor auth)
+            // This must be sent immediately after WebSocket connection for authentication
+            JsonDocument regDoc;
+            regDoc["type"] = "register";
+            regDoc["device_type"] = "esp32_eink";
+            regDoc["auth_token"] = cfg.security.auth_token;
+
+            // Include AES key if available
+            if (!hexKey.isEmpty()) {
+                regDoc["aes_key"] = hexKey;
+            }
+
+            String regMsg;
+            serializeJson(regDoc, regMsg);
+            webSocket.sendTXT(regMsg);
+
+            if (!hexKey.isEmpty()) {
+                logMessage(LOG_INFO, "WS", "Sent registration with auth_token and AES key");
+            } else {
+                logMessage(LOG_INFO, "WS", "Sent registration with auth_token");
             }
 
             // Check for firmware updates on first WebSocket connection (power-on boot only)
@@ -2080,6 +2093,40 @@ void handleWebSocketMessage(const uint8_t* payload, size_t length) {
                 String line1 = "Setup Required";
                 String line2 = String("ID: ") + (deviceId[0] ? deviceId : cfg.device.id.c_str());
                 String line3 = "Complete registration";
+                String line4 = "then RESTART device";
+                DisplayManager::showMessage(line1, line2, line3, line4);
+
+                // Mark registration as permanently failed (stop reconnecting)
+                registrationFailedPermanently = true;
+                wsConnected = false;
+                webSocket.disconnect();
+
+                // Deep sleep for 10 minutes, then wake to check again
+                // Counter will reset on wake (not RTC), so gets fresh 3 attempts
+                delay(2000);  // Show message for 2 seconds before sleeping
+                enterDeepSleep(10);  // 10 minutes (parameter is in minutes, not microseconds)
+                // Never returns from deep sleep
+            }
+        } else if (strcmp(errorCode, "INVALID_AUTH_TOKEN") == 0 || strcmp(errorCode, "AUTH_FAILED") == 0) {
+            // Handle authentication failures - config error, not transient
+            const AppConfig& cfg = ConfigManager::getConfig();
+
+            registrationErrorCount++;
+
+            if (registrationErrorCount < MAX_REGISTRATION_RETRIES) {
+                // Attempts 1-2: Show retry screen (in case of transient issue)
+                String line1 = "Auth Failed";
+                String line2 = String("Attempt ") + registrationErrorCount + " of 2";
+                String line3 = "Check auth_token";
+                String line4 = "in config.json";
+                DisplayManager::showMessage(line1, line2, line3, line4);
+
+                delay(30000);  // 30 seconds between retries
+            } else {
+                // Attempt 3: Show permanent error screen - this is a config issue
+                String line1 = "Auth Token Invalid";
+                String line2 = "Fix config.json:";
+                String line3 = "security.auth_token";
                 String line4 = "then RESTART device";
                 DisplayManager::showMessage(line1, line2, line3, line4);
 
@@ -2787,7 +2834,7 @@ public:
         logMessage(LOG_INFO, "WS", "Connecting", logBuf);
 
         // Build WebSocket path with device_id and display_variant
-        String path = cfg.server.path + "?rpi_id=";
+        String path = cfg.server.path + "?device_id=";
         path += cfg.device.id;
 
         // Add display_variant if configured (for OTA firmware tracking)

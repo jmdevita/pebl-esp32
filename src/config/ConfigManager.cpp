@@ -41,6 +41,7 @@ void ConfigManager::setDefaults() {
     config.display.rotation = 1;
 
     // Security defaults
+    config.security.auth_token = "";  // Must be set in config.json
     config.security.use_aes = false;
     config.security.aes_key = "";
 
@@ -166,6 +167,7 @@ bool ConfigManager::loadFromJson(const String& jsonStr) {
     // Parse security section
     if (doc["security"].is<JsonObject>()) {
         JsonObject security = doc["security"];
+        config.security.auth_token = security["auth_token"] | config.security.auth_token;
         config.security.use_aes = security["use_aes"] | config.security.use_aes;
         config.security.aes_key = security["aes_key"] | config.security.aes_key;
     }
@@ -273,6 +275,7 @@ String ConfigManager::toJson() {
 
     // Security section
     JsonObject security = doc["security"].to<JsonObject>();
+    security["auth_token"] = config.security.auth_token;
     security["use_aes"] = config.security.use_aes;
     security["aes_key"] = config.security.aes_key;
 

@@ -45,6 +45,7 @@ struct AppConfig {
 
     // Security settings
     struct {
+        String auth_token;     // Device authentication token (two-factor auth with device_id)
         bool use_aes;
         String aes_key;
     } security;
