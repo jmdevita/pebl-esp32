@@ -1490,6 +1490,12 @@ bool fetchTimezoneFromServer() {
     // Append timezone lookup endpoint path
     url += "/api/timezone/lookup";
 
+    // Conditionally add update_db parameter to sync timezone to server
+    // This enables local time display on messages (e.g., "sent at 19:15 EST" vs "sent at 00:15 UTC")
+    if (cfg.timezone.update_server) {
+        url += "?update_db=true";
+    }
+
     http.begin(secureClient, url);
 
     // Add two-factor authentication headers (same as WebSocket connection)

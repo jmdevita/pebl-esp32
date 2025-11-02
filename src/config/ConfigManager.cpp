@@ -57,6 +57,7 @@ void ConfigManager::setDefaults() {
     config.timezone.sync_interval_hours = 24;
     config.timezone.source = "server";                 // Default to server GeoIP (free, unlimited)
     config.timezone.ipgeolocation_api_key = "";        // Empty by default
+    config.timezone.update_server = true;              // Default: sync timezone to server for local time display
 
     // Quiet hours defaults
     config.quiet_hours.start_hour = 23;  // 11 PM
@@ -194,6 +195,7 @@ bool ConfigManager::loadFromJson(const String& jsonStr) {
         config.timezone.sync_interval_hours = timezone["sync_interval_hours"] | config.timezone.sync_interval_hours;
         config.timezone.source = timezone["source"] | config.timezone.source;
         config.timezone.ipgeolocation_api_key = timezone["ipgeolocation_api_key"] | config.timezone.ipgeolocation_api_key;
+        config.timezone.update_server = timezone["update_server"] | config.timezone.update_server;
     }
 
     // Parse quiet_hours section
@@ -333,6 +335,7 @@ String ConfigManager::toJson() {
     timezone["sync_interval_hours"] = config.timezone.sync_interval_hours;
     timezone["source"] = config.timezone.source;
     timezone["ipgeolocation_api_key"] = config.timezone.ipgeolocation_api_key;
+    timezone["update_server"] = config.timezone.update_server;
 
     // Quiet hours section
     JsonObject quiet_hours = doc["quiet_hours"].to<JsonObject>();

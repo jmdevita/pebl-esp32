@@ -69,6 +69,7 @@ struct AppConfig {
         uint8_t sync_interval_hours;      // How often to re-sync (default: 24, range: 1-168 hours)
         String source;                    // "server" or "ipgeolocation"
         String ipgeolocation_api_key;     // IPGeolocation.io API key (only if source = "ipgeolocation")
+        bool update_server;               // Whether to sync timezone to server (enables local time display)
     } timezone;
 
     // Quiet hours settings
