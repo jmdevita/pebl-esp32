@@ -1,11 +1,13 @@
 # ESP32 Installation Guide
 
-Complete guide for installing the Slack Reactions client on your LilyGo T5 ESP32.
+Complete step-by-step guide for installing the Slack Reactions client on your LilyGo T5 ESP32.
+
+**Quick overview:** For a high-level summary, see [README.md](../README.md#quick-start)
 
 ## Prerequisites
 
 1. **Hardware**
-   - LilyGo T5 V2.3.1 (or compatible)
+   - LilyGo T5 V2.3.1 (or compatible) - See [supported devices](../README.md#supported-devices)
    - USB-C cable (data capable, not charge-only)
 
 2. **Software**
@@ -24,7 +26,11 @@ cd esp32_arduino_client
 
 ### 2. Configure Device Settings
 
-Edit `data/config.json` with your specific settings:
+Edit `data/config.json` with your specific settings.
+
+**📖 For complete configuration reference including power management, quiet hours, and display policies, see [README.md - Configuration](../README.md#configuration)**
+
+**Minimal example:**
 
 ```json
 {
@@ -39,7 +45,7 @@ Edit `data/config.json` with your specific settings:
     "reconnect_interval_ms": 30000
   },
   "server": {
-    "host": "slack-reactions.devita.dev",  // Your server
+    "host": "slack-reactions.your-domain.com",  // Your server
     "port": 443,
     "path": "/ws-stream",
     "use_ssl": true
@@ -61,10 +67,10 @@ If you need a new AES key:
 
 ```bash
 # Generate random 32-byte key and encode to base64
-echo -n "your32bytekey_exactly32characters" | base64
-# Or generate random:
 openssl rand -base64 32 | head -c 44
 ```
+
+**⚠️ Security note:** For important security considerations about key transmission, see [SECURITY_NOTES.md](SECURITY_NOTES.md)
 
 ### 4. Build and Upload Firmware
 
@@ -130,6 +136,7 @@ while True:
    ```
 
 3. **Verify WiFi credentials** in config.json
+4. **Check 2.4GHz network** - ESP32 doesn't support 5GHz WiFi
 
 ### Server Rejects Connection
 

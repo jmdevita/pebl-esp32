@@ -67,104 +67,46 @@ See [docs/DISPLAY_SUPPORT.md](docs/DISPLAY_SUPPORT.md) for detailed driver infor
 
 ## Documentation
 
-- **[Version Management](docs/VERSION_MANAGEMENT.md)** - How to manage firmware versions and releases
-- **[Display Support](docs/DISPLAY_SUPPORT.md)** - Supported displays and driver details
-- **[Installation Guide](docs/INSTALLATION_GUIDE.md)** - Detailed setup instructions
-- **[WiFi Improvements](docs/WIFI_IMPROVEMENTS.md)** - WiFi optimization and troubleshooting
-- **[USB & Battery Detection](docs/USB_BATTERY_DETECTION.md)** - Power management details
-- **[Security Notes](docs/SECURITY_NOTES.md)** - Encryption and security information
+- **[Installation Guide](docs/INSTALLATION_GUIDE.md)** - Step-by-step setup and troubleshooting
+- **[Display Support](docs/DISPLAY_SUPPORT.md)** - Supported displays and driver configuration
+- **[Security Notes](docs/SECURITY_NOTES.md)** - Encryption and security considerations
 
-## Installation
+## Quick Start
 
-### 1. Clone and Navigate
+**For detailed installation instructions, troubleshooting, and first-time setup, see [docs/INSTALLATION_GUIDE.md](docs/INSTALLATION_GUIDE.md)**
+
+### 1. Install PlatformIO
 
 ```bash
-cd esp32_arduino_client
+# Via VS Code: Install PlatformIO IDE extension
+# Or via CLI: pip install platformio
 ```
 
-### 2. Configure Your Device
+### 2. Configure Device
 
-Edit `data/config.json` with your settings:
+Edit `data/config.json` (see [example config](#configuration) below):
 
 ```json
 {
-  "device": {
-    "id": "your_device_id",
-    "name": "Your Display Name"
-  },
-  "wifi": {
-    "ssid": "Your_WiFi_SSID",
-    "password": "Your_WiFi_Password",
-    "timeout_ms": 15000,
-    "reconnect_interval_ms": 30000
-  },
-  "server": {
-    "host": "your-server.com",
-    "port": 443,
-    "path": "/ws-stream",
-    "use_ssl": true
-  },
-  "display": {
-    "width": 212,
-    "height": 104,
-    "rotation": 1,
-    "pins": {
-      "cs": 5,
-      "dc": 17,
-      "rst": 16,
-      "busy": 4,
-      "sclk": 18,
-      "mosi": 23
-    }
-  },
-  "timing": {
-    "heartbeat_interval_ms": 15000,
-    "heartbeat_timeout_ms": 30000,
-    "ws_initial_reconnect_ms": 15000,
-    "ws_max_reconnect_ms": 60000
-  },
-  "power": {
-    "sleep_enabled": true,
-    "sleep_duration_min": 5,
-    "battery_pin": 36,
-    "usb_threshold_v": 4.2
-  },
-  "security": {
-    "use_aes": true,
-    "aes_key": "base64_encoded_32_byte_key"
-  },
-  "logging": {
-    "default_level": "WARN",
-    "enable_test_commands": false
-  }
+  "device": {"id": "your_device_id", "name": "Living Room Display"},
+  "wifi": {"ssid": "Your_WiFi", "password": "password"},
+  "server": {"host": "your-server.com", "port": 443, "use_ssl": true},
+  "security": {"use_aes": true, "aes_key": "base64_key"}
 }
 ```
 
 ### 3. Build and Upload
 
-Using PlatformIO CLI:
-
 ```bash
-# Build firmware
-pio run
-
-# Upload firmware
-pio run -t upload
-
-# Upload filesystem (config.json)
-pio run -t uploadfs
-
-# Monitor serial output
-pio device monitor -b 115200
+pio run -e lilygo_t5_depg_bw    # Build for your display type
+pio run -t upload                # Upload firmware
+pio run -t uploadfs              # Upload config.json to SPIFFS
+pio device monitor -b 115200     # Monitor serial output
 ```
 
-Using VS Code with PlatformIO:
-
-1. Open the project folder in VS Code
-2. Select your environment from the PlatformIO toolbar
-3. Click "Upload Filesystem Image" (→ icon)
-4. Click "Upload" (→ icon)
-5. Click "Serial Monitor" to view output
+**Need help?**
+- 🔧 [Installation Guide](docs/INSTALLATION_GUIDE.md) - Complete setup with troubleshooting
+- 🖥️ [Display Support](docs/DISPLAY_SUPPORT.md) - Choosing the right display driver
 
 ## Configuration
 
@@ -291,19 +233,12 @@ The battery indicator appears in the top-right corner of all displays:
 
 ### Encryption & Security
 
-This client uses AES-256-CBC encryption with a hex-encoded message format:
+This client uses AES-256-CBC encryption with a hex-encoded message format.
 
 **Message Format:**
 - Server sends: `"AES:" + (iv + ciphertext).hex()`
 - IV: First 32 hex characters (16 bytes)
 - Ciphertext: Remaining hex characters (variable length)
-
-**Security Features:**
-- End-to-end encryption with 256-bit AES keys
-- Unique IV per message
-- PKCS7 padding for block alignment
-- Encrypted data as opaque blob (security best practice)
-- Automatic key registration via WebSocket handshake
 
 **Key Management:**
 - AES key stored base64-encoded in config.json
@@ -311,11 +246,19 @@ This client uses AES-256-CBC encryption with a hex-encoded message format:
 - Generate with: `openssl rand -base64 32`
 - Server and client must share the same key
 
+**⚠️ Security Considerations:**
+
+For a detailed security analysis including limitations and potential improvements, see **[docs/SECURITY_NOTES.md](docs/SECURITY_NOTES.md)**.
+
+**TL;DR:** Current implementation is adequate for personal use (Slack reactions) but transmits symmetric keys over TLS. For sensitive production use, consider implementing Diffie-Hellman key exchange or RSA-wrapped keys.
+
 ### Getting Auth Token
 
 1. Register your device with the server
 2. Link your Slack account via OAuth
 3. Retrieve the auth token from the server
+
+**Troubleshooting authentication issues:** See [Installation Guide - Server Rejects Connection](docs/INSTALLATION_GUIDE.md#server-rejects-connection)
 
 ## Project Structure
 
@@ -344,34 +287,29 @@ esp32_arduino_client/
 
 ## Troubleshooting
 
-### Display Not Working
+**For comprehensive troubleshooting with detailed solutions, see [docs/INSTALLATION_GUIDE.md](docs/INSTALLATION_GUIDE.md#troubleshooting)**
 
-1. Verify display dimensions (width/height) match your hardware in config.json
-2. Check display connections (SPI pins)
-3. Try different rotation values
-4. Ensure you selected the correct PlatformIO environment for your display
-5. Check serial monitor for display driver initialization messages
+### Quick Diagnostics
 
-### WiFi Connection Issues
+**Display Not Working**
+- Verify display type matches hardware (see [Display Support](docs/DISPLAY_SUPPORT.md))
+- Check SPI pin connections in config.json
+- Try different rotation values
 
-1. Check SSID and password in config.json
-2. Ensure 2.4GHz network (ESP32 doesn't support 5GHz)
-3. Verify router allows IoT devices
-4. Check serial monitor for error messages
+**WiFi Connection Issues**
+- Check SSID/password in config.json
+- Ensure 2.4GHz network (ESP32 doesn't support 5GHz)
+- Close serial monitor and re-upload: `pio run -t uploadfs`
 
-### WebSocket Connection Failed
+**WebSocket Connection Failed**
+- Verify server URL includes `wss://` protocol
+- Ensure device ID is registered on server
+- See [Installation Guide - Server Rejects Connection](docs/INSTALLATION_GUIDE.md#server-rejects-connection)
 
-1. Verify server URL includes `wss://` protocol
-2. Check auth token is valid
-3. Ensure device ID is registered on server
-4. Monitor serial output for authentication errors
-
-### Upload Errors
-
-1. Hold BOOT button while uploading starts
-2. Try lower upload speed in platformio.ini
-3. Check USB cable supports data (not charge-only)
-4. Install correct USB drivers for your board
+**Upload Errors**
+- Hold BOOT button while uploading starts
+- Check USB cable supports data (not charge-only)
+- See [Installation Guide - If Serial Port is Busy](docs/INSTALLATION_GUIDE.md#if-serial-port-is-busy)
 
 ## Serial Monitor Output
 
