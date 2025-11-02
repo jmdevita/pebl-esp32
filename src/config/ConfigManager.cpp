@@ -32,7 +32,7 @@ void ConfigManager::setDefaults() {
     config.wifi.max_failed_wakes = 20;
 
     // Server defaults
-    config.server.host = "slack-reactions.devita.dev";
+    config.server.host = "";  // Must be set in config.json
     config.server.port = 443;
     config.server.path = "/ws-stream";
     config.server.use_ssl = true;
@@ -55,6 +55,8 @@ void ConfigManager::setDefaults() {
 
     // Timezone defaults
     config.timezone.sync_interval_hours = 24;
+    config.timezone.source = "server";                 // Default to server GeoIP (free, unlimited)
+    config.timezone.ipgeolocation_api_key = "";        // Empty by default
 
     // Quiet hours defaults
     config.quiet_hours.start_hour = 23;  // 11 PM
@@ -190,6 +192,8 @@ bool ConfigManager::loadFromJson(const String& jsonStr) {
     if (doc["timezone"].is<JsonObject>()) {
         JsonObject timezone = doc["timezone"];
         config.timezone.sync_interval_hours = timezone["sync_interval_hours"] | config.timezone.sync_interval_hours;
+        config.timezone.source = timezone["source"] | config.timezone.source;
+        config.timezone.ipgeolocation_api_key = timezone["ipgeolocation_api_key"] | config.timezone.ipgeolocation_api_key;
     }
 
     // Parse quiet_hours section
@@ -212,6 +216,46 @@ bool ConfigManager::loadFromJson(const String& jsonStr) {
     if (config.device.display_variant.isEmpty()) {
         logMessage("WARN", "CONFIG", "display_variant not set - OTA updates will be disabled");
         logMessage("WARN", "CONFIG", "Add display_variant to config.json to enable OTA (see config.json.example)");
+    }
+
+    // Validate sync_interval_hours (1-168 hours = 1 week max)
+    // Minimum prevents excessive syncing/battery drain, maximum prevents RTC drift accumulation
+    if (config.timezone.sync_interval_hours < 1) {
+        char buf[64];
+        snprintf(buf, sizeof(buf), "invalid_interval=%d clamping_to=1",
+                config.timezone.sync_interval_hours);
+        logMessage("WARN", "CONFIG", "Sync interval too low", buf);
+        config.timezone.sync_interval_hours = 1;
+    } else if (config.timezone.sync_interval_hours > 168) {
+        char buf[64];
+        snprintf(buf, sizeof(buf), "invalid_interval=%d clamping_to=168",
+                config.timezone.sync_interval_hours);
+        logMessage("WARN", "CONFIG", "Sync interval too high (max 1 week)", buf);
+        config.timezone.sync_interval_hours = 168;
+    }
+
+    // Validate timezone source
+    config.timezone.source.toLowerCase();  // Normalize to lowercase
+    if (config.timezone.source != "server" &&
+        config.timezone.source != "ipgeolocation") {
+        char buf[128];
+        snprintf(buf, sizeof(buf), "invalid_source=%s defaulting_to=server",
+                config.timezone.source.c_str());
+        logMessage("WARN", "CONFIG", "Invalid timezone source", buf);
+        config.timezone.source = "server";
+    }
+
+    // Validate API key length (prevent memory issues)
+    // IPGeolocation.io API keys are typically 32 characters
+    if (config.timezone.ipgeolocation_api_key.length() > 256) {
+        logMessage("ERROR", "CONFIG", "IPGeolocation API key exceeds maximum length (256 chars), clearing");
+        config.timezone.ipgeolocation_api_key = "";  // Clear invalid key
+    }
+
+    // Warn if ipgeolocation selected but no API key
+    if (config.timezone.source == "ipgeolocation" && config.timezone.ipgeolocation_api_key.isEmpty()) {
+        logMessage("WARN", "CONFIG", "timezone.source='ipgeolocation' but ipgeolocation_api_key is empty!");
+        logMessage("WARN", "CONFIG", "Device will fail to sync timezone. Set ipgeolocation_api_key or change source to 'server'.");
     }
 
     logMessage("INFO", "CONFIG", "Configuration loaded successfully");
@@ -287,6 +331,8 @@ String ConfigManager::toJson() {
     // Timezone section
     JsonObject timezone = doc["timezone"].to<JsonObject>();
     timezone["sync_interval_hours"] = config.timezone.sync_interval_hours;
+    timezone["source"] = config.timezone.source;
+    timezone["ipgeolocation_api_key"] = config.timezone.ipgeolocation_api_key;
 
     // Quiet hours section
     JsonObject quiet_hours = doc["quiet_hours"].to<JsonObject>();

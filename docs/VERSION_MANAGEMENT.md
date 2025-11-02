@@ -313,7 +313,7 @@ export FIRMWARE_ADMIN_KEY="your_key"
 
 **What it does:**
 1. Checks that firmware binaries exist
-2. POSTs each variant to `/api/firmware/admin/publish`
+2. POSTs each variant to the firmware publishing endpoint (requires admin API key)
 3. Reports success/failure summary
 
 ---

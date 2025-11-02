@@ -64,9 +64,11 @@ struct AppConfig {
     } logging;
 
     // Timezone settings
-    // Note: API URL and key are hardcoded in firmware (no user configuration needed)
+    // Supports two sources: "server" (default, free), "ipgeolocation" (requires API key)
     struct {
-        uint8_t sync_interval_hours;  // How often to re-sync (default: 24)
+        uint8_t sync_interval_hours;      // How often to re-sync (default: 24, range: 1-168 hours)
+        String source;                    // "server" or "ipgeolocation"
+        String ipgeolocation_api_key;     // IPGeolocation.io API key (only if source = "ipgeolocation")
     } timezone;
 
     // Quiet hours settings

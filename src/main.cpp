@@ -123,7 +123,7 @@ namespace DisplayLimits {
 
     // Emoji position: leaves space for lock icon (top-left) and battery indicator (top-right)
     constexpr int16_t EMOJI_X = 10;  // 10px from left
-    constexpr int16_t EMOJI_Y = 38;  // 38px from top (moved down for spacing)
+    constexpr int16_t EMOJI_Y = 32;  // 32px from top (optimized for balanced layout)
 }
 
 // ============================================================================
@@ -893,7 +893,7 @@ public:
             // Server sends emoji field as ":emoji_name:" so no need to add extra colons
             if (!emojiRendered) {
                 display->setFont(&FreeSans12pt7b);
-                display->setCursor(10, 63);
+                display->setCursor(10, 57);  // Aligned with balanced layout
                 display->print(emoji);
             }
 
@@ -906,15 +906,16 @@ public:
             int16_t userX = 60;
             int16_t userMaxWidth = display->width() - userX - rightMargin;
             String userStr = truncateToFit(user, &FreeSansBold9pt7b, userX, userMaxWidth);
-            display->setCursor(userX, 48);
+            display->setCursor(userX, 42);  // Positioned for balanced layout
             display->print(userStr);
 
-            // Message text below user name (regular font, with small whitespace)
+            // Message text below user name (italicized font, with small whitespace)
             if (message[0] != '\0') {
+                display->setFont(&FreeSansOblique9pt7b);  // Use italicized font for message text
                 int16_t messageX = 60;
                 int16_t messageMaxWidth = display->width() - messageX - rightMargin;
-                String messageStr = truncateToFit(message, &FreeSans9pt7b, messageX, messageMaxWidth);
-                display->setCursor(messageX, 68);  // Y=68 provides spacing between username and message text
+                String messageStr = truncateToFit(message, &FreeSansOblique9pt7b, messageX, messageMaxWidth);
+                display->setCursor(messageX, 62);  // Positioned for balanced layout with spacing
                 display->print(messageStr);
             }
 
@@ -928,7 +929,7 @@ public:
             display->getTextBounds(channelLabel, 0, 0, &x1, &y1, &w, &h);
 
             int16_t channelX = display->width() - w - rightMargin;
-            display->setCursor(channelX, 100);  // Moved down to 100 for extra whitespace
+            display->setCursor(channelX, 92);  // Positioned closer to message content
             display->print(channelLabel);
 
             // Timestamp at bottom left with smaller font
@@ -1458,34 +1459,46 @@ void handleCriticalLowBatteryWarning() {
 // ============================================================================
 
 /**
- * Fetch timezone information from IPGeolocation.io API
+ * Fetch timezone from server's GeoIP endpoint
+ * Uses two-factor authentication (X-Device-ID + X-Auth-Token)
+ * No API key needed - uses MaxMind GeoLite2 database on server
  * Returns true if successful, false otherwise
  */
-bool fetchTimezoneFromAPI() {
-    // Timezone API settings (hardcoded - ipgeolocation.io free tier)
-    constexpr const char* TIMEZONE_API_URL = "https://api.ipgeolocation.io/timezone";
-    constexpr const char* TIMEZONE_API_KEY = "420755f05aa14c8f96f8dae5d8176022";
+bool fetchTimezoneFromServer() {
+    const AppConfig& cfg = ConfigManager::getConfig();
 
-    // Configure HTTPS with Mozilla CA certificate bundle (146 root CAs)
+    // Configure HTTPS client
     WiFiClientSecure secureClient;
 
-    // Access embedded certificate bundle
-    extern const uint8_t rootca_crt_bundle_start[] asm("_binary_certs_x509_crt_bundle_bin_start");
-    extern const uint8_t rootca_crt_bundle_end[] asm("_binary_certs_x509_crt_bundle_bin_end");
-    size_t bundle_size = rootca_crt_bundle_end - rootca_crt_bundle_start;
-    secureClient.setCACertBundle(rootca_crt_bundle_start, bundle_size);
+    // Skip SSL certificate validation for Cloudflare tunnels (matches OTAManager behavior)
+    // If server uses standard SSL certificate, this still works but is less secure
+    secureClient.setInsecure();
 
     HTTPClient http;
     http.setTimeout(10000);  // 10 second timeout (increased from 5s)
 
-    // Build URL with API key
-    String url = String(TIMEZONE_API_URL) + "?apiKey=" + TIMEZONE_API_KEY;
+    // Build server URL from configuration
+    String protocol = cfg.server.use_ssl ? "https://" : "http://";
+    String url = protocol + cfg.server.host;
+
+    // Add port if non-standard (not 80 for HTTP or 443 for HTTPS)
+    if ((cfg.server.use_ssl && cfg.server.port != 443) ||
+        (!cfg.server.use_ssl && cfg.server.port != 80)) {
+        url += ":" + String(cfg.server.port);
+    }
+
+    // Append timezone lookup endpoint path
+    url += "/api/timezone/lookup";
 
     http.begin(secureClient, url);
 
+    // Add two-factor authentication headers (same as WebSocket connection)
+    http.addHeader("X-Device-ID", cfg.device.id);
+    http.addHeader("X-Auth-Token", cfg.security.auth_token);
+
     char logBuf[128];
-    snprintf(logBuf, sizeof(logBuf), "url=%s", TIMEZONE_API_URL);
-    logMessage(LOG_INFO, "TIME", "Fetching timezone from API", logBuf);
+    snprintf(logBuf, sizeof(logBuf), "url=%s", url.c_str());
+    logMessage(LOG_INFO, "TIME", "Fetching timezone from server GeoIP", logBuf);
 
     int httpCode = http.GET();
 
@@ -1494,8 +1507,7 @@ bool fetchTimezoneFromAPI() {
         http.end();
 
         // Parse JSON response
-        // API returns ~1.5KB response with nested geo object
-        // Use JsonDocument with filter to parse only needed fields (reduces memory)
+        // Server returns IPGeolocation.io-compatible format
         JsonDocument doc;
         DeserializationError error = deserializeJson(doc, response);
 
@@ -1506,7 +1518,7 @@ bool fetchTimezoneFromAPI() {
         }
 
         // Extract timezone data
-        // IPGeolocation.io response format:
+        // Response format:
         // {
         //   "date_time_unix": 1761273385.454,
         //   "timezone": "America/New_York",
@@ -1551,7 +1563,7 @@ bool fetchTimezoneFromAPI() {
 
         // On ESP32, time_t is int64_t (64-bit), must use %lld not %ld to avoid truncation
         snprintf(logBuf, sizeof(logBuf),
-                "tz=%s offset=%ds unix=%lld dst=%s",
+                "tz=%s offset=%ds unix=%lld dst=%s source=server",
                 tzName,
                 timezoneOffsetSeconds,
                 (long long)currentTime,
@@ -1564,9 +1576,149 @@ bool fetchTimezoneFromAPI() {
         return true;
     } else {
         snprintf(logBuf, sizeof(logBuf), "http_code=%d", httpCode);
-        logMessage(LOG_WARN, "TIME", "API request failed", logBuf);
+        logMessage(LOG_WARN, "TIME", "Server GeoIP request failed", logBuf);
         http.end();
         return false;
+    }
+}
+
+/**
+ * Fetch timezone from IPGeolocation.io API
+ * Uses user's API key from config (1000 requests/day free tier)
+ * SSL certificate validation enabled (Mozilla CA bundle)
+ * Returns true if successful, false otherwise
+ */
+bool fetchTimezoneFromIPGeolocation() {
+    const AppConfig& cfg = ConfigManager::getConfig();
+
+    // Validate API key is configured
+    if (cfg.timezone.ipgeolocation_api_key.isEmpty()) {
+        logMessage(LOG_ERROR, "TIME", "IPGeolocation API key not configured in config.json");
+        return false;
+    }
+
+    // Configure HTTPS client with Mozilla CA certificate bundle
+    WiFiClientSecure secureClient;
+
+    // Use Mozilla CA certificate bundle for proper SSL validation (IPGeolocation.io uses standard certs)
+    extern const uint8_t rootca_crt_bundle_start[] asm("_binary_certs_x509_crt_bundle_bin_start");
+    extern const uint8_t rootca_crt_bundle_end[] asm("_binary_certs_x509_crt_bundle_bin_end");
+    size_t bundle_size = rootca_crt_bundle_end - rootca_crt_bundle_start;
+    secureClient.setCACertBundle(rootca_crt_bundle_start, bundle_size);
+
+    HTTPClient http;
+    http.setTimeout(10000);  // 10 second timeout
+
+    // Build IPGeolocation.io API URL
+    // NOTE: API key is sent as query parameter (standard practice for this API)
+    // Security: Connection is encrypted with TLS, API key is not logged
+    String url = "https://api.ipgeolocation.io/timezone?apiKey=" + cfg.timezone.ipgeolocation_api_key;
+
+    http.begin(secureClient, url);
+
+    char logBuf[128];
+    // Don't log URL to avoid exposing API key in logs
+    logMessage(LOG_INFO, "TIME", "Fetching timezone from IPGeolocation.io", nullptr);
+
+    int httpCode = http.GET();
+
+    if (httpCode == 200) {
+        String response = http.getString();
+        http.end();
+
+        // Parse JSON response
+        JsonDocument doc;
+        DeserializationError error = deserializeJson(doc, response);
+
+        if (error) {
+            snprintf(logBuf, sizeof(logBuf), "error=%s", error.c_str());
+            logMessage(LOG_ERROR, "TIME", "JSON parse error", logBuf);
+            return false;
+        }
+
+        // Extract timezone data
+        // IPGeolocation.io response format:
+        // {
+        //   "date_time_unix": 1761273385.454,
+        //   "timezone": "America/New_York",
+        //   "timezone_offset": -5,
+        //   "timezone_offset_with_dst": -4,
+        //   "is_dst": true
+        // }
+
+        // API returns a double, extract as double first to preserve precision
+        double timestamp_double = doc["date_time_unix"].as<double>();
+        time_t timestamp = static_cast<time_t>(timestamp_double);
+
+        // Validate timestamp (must be after Jan 1, 2020 and before year 2100)
+        constexpr time_t MIN_VALID_TIMESTAMP = 1577836800;
+        constexpr time_t MAX_VALID_TIMESTAMP = 4102444800;
+
+        if (timestamp < MIN_VALID_TIMESTAMP || timestamp > MAX_VALID_TIMESTAMP) {
+            snprintf(logBuf, sizeof(logBuf),
+                    "timestamp=%lld (%.3f) out_of_range min=%lld max=%lld",
+                    (long long)timestamp, timestamp_double,
+                    (long long)MIN_VALID_TIMESTAMP, (long long)MAX_VALID_TIMESTAMP);
+            logMessage(LOG_ERROR, "TIME", "Invalid timestamp from API", logBuf);
+            return false;
+        }
+
+        currentTime = timestamp;
+        timezoneOffsetSeconds = doc["timezone_offset_with_dst"].as<int>() * 3600;  // Convert hours to seconds
+        lastTimeSyncTimestamp = currentTime;
+
+        // Set ESP32 system clock to UTC time
+        struct timeval tv;
+        tv.tv_sec = timestamp;
+        tv.tv_usec = 0;
+        settimeofday(&tv, NULL);
+
+        const char* tzName = doc["timezone"] | "Unknown";
+        bool isDST = doc["is_dst"] | false;
+
+        snprintf(logBuf, sizeof(logBuf),
+                "tz=%s offset=%ds unix=%lld dst=%s source=ipgeolocation",
+                tzName,
+                timezoneOffsetSeconds,
+                (long long)currentTime,
+                isDST ? "true" : "false");
+        logMessage(LOG_INFO, "TIME", "Timezone synced successfully", logBuf);
+
+        hasEverSynced = true;
+        return true;
+    } else {
+        snprintf(logBuf, sizeof(logBuf), "http_code=%d", httpCode);
+        logMessage(LOG_WARN, "TIME", "IPGeolocation.io request failed", logBuf);
+        http.end();
+        return false;
+    }
+}
+
+/**
+ * Fetch timezone information (dispatcher for all timezone sources)
+ * Routes to appropriate function based on config.timezone.source:
+ * - "server": Server-side GeoIP (free, unlimited, requires auth, default)
+ * - "ipgeolocation": IPGeolocation.io API (1000/day free, requires API key)
+ * Returns true if successful, false otherwise
+ */
+bool fetchTimezoneFromAPI() {
+    const AppConfig& cfg = ConfigManager::getConfig();
+    String source = cfg.timezone.source;
+    source.toLowerCase();  // Normalize for comparison
+
+    char logBuf[64];
+    snprintf(logBuf, sizeof(logBuf), "source=%s", source.c_str());
+    logMessage(LOG_INFO, "TIME", "Fetching timezone", logBuf);
+
+    if (source == "server") {
+        return fetchTimezoneFromServer();
+    } else if (source == "ipgeolocation") {
+        return fetchTimezoneFromIPGeolocation();
+    } else {
+        // Invalid source - log warning and fall back to server
+        snprintf(logBuf, sizeof(logBuf), "invalid_source=%s fallback=server", source.c_str());
+        logMessage(LOG_WARN, "TIME", "Invalid timezone source", logBuf);
+        return fetchTimezoneFromServer();
     }
 }
 
@@ -3292,6 +3444,12 @@ void setup() {
                 snprintf(timeBuf, sizeof(timeBuf), "current_hour=%d quiet_hours=%s",
                         hour, isQuietHours() ? "yes" : "no");
                 logMessage(LOG_INFO, "TIME", "Timezone sync complete", timeBuf);
+
+                // SSL/TLS cleanup delay: After HTTPS timezone fetch, allow SSL/TLS stack time to
+                // release resources before WebSocket SSL handshake. Without this, the first WebSocket
+                // connection may fail with ABNORMAL_CLOSURE (1006) due to resource contention between
+                // HTTPClient SSL and WebSocket SSL operations.
+                delay(1000);
             } else {
                 // Sync failed - will retry on next wake if shouldSyncTimezone() returns true
                 if (!hasEverSynced) {

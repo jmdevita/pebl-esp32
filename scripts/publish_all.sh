@@ -7,15 +7,23 @@ set -e  # Exit on error
 VERSION="$1"
 CHANGELOG="${2:-Release $VERSION}"
 API_KEY="${3:-$FIRMWARE_ADMIN_KEY}"  # Can set FIRMWARE_ADMIN_KEY env var
-SERVER_URL="${FIRMWARE_SERVER_URL:-https://slack-reactions.devita.dev}"
+SERVER_URL="$FIRMWARE_SERVER_URL"  # REQUIRED: Must set FIRMWARE_SERVER_URL env var
 
 if [ -z "$VERSION" ]; then
     echo "Usage: $0 <version> [changelog] [api_key]"
     echo "Example: $0 1.0.3 'Bug fixes and improvements'"
     echo ""
-    echo "Set FIRMWARE_ADMIN_KEY env var to avoid passing API key:"
+    echo "Required environment variables:"
+    echo "  export FIRMWARE_SERVER_URL='https://your-server.com'"
     echo "  export FIRMWARE_ADMIN_KEY='your_key'"
-    echo "  $0 1.0.3 'Bug fixes'"
+    echo ""
+    echo "Then run: $0 1.0.3 'Bug fixes'"
+    exit 1
+fi
+
+if [ -z "$SERVER_URL" ]; then
+    echo "Error: FIRMWARE_SERVER_URL environment variable not set"
+    echo "Set it with: export FIRMWARE_SERVER_URL='https://your-server.com'"
     exit 1
 fi
 

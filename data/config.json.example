@@ -25,7 +25,7 @@
     "auth_token": "YOUR_AUTH_TOKEN_FROM_ADMIN_PANEL",
     "use_aes": true,
     "aes_key": "YOUR_32_BYTE_HEX_AES_KEY_HERE",
-    "_comment": "auth_token REQUIRED for device authentication (two-factor: device_id + token). Get from admin panel (/admin/tokens/generate)."
+    "_comment": "auth_token REQUIRED for device authentication (two-factor: device_id + token). Contact your server administrator to generate a token."
   },
   "power": {
     "sleep_enabled": true,
@@ -36,7 +36,10 @@
     "enable_test_commands": false
   },
   "timezone": {
-    "sync_interval_hours": 24
+    "sync_interval_hours": 24,
+    "source": "server",
+    "ipgeolocation_api_key": "",
+    "_comment": "Timezone auto-detection. sync_interval_hours: 1-168 (default: 24, max: 1 week to limit RTC drift). source: 'server' (default, free, unlimited, uses server-side GeoIP) | 'ipgeolocation' (requires ipgeolocation_api_key from ipgeolocation.io, 1000 requests/day free tier). Get IPGeolocation.io API key at https://ipgeolocation.io/signup.html"
   },
   "quiet_hours": {
     "start_hour": 23,
