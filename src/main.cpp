@@ -2691,6 +2691,23 @@ public:
 
             WiFi.mode(WIFI_STA);
 
+            // Set network hostname using device.name from config (RFC 1123 compliant)
+            // Always append 4-char device ID hash to ensure uniqueness across multiple devices
+            // Example: "Slack Reactions Display" -> "slack-reactions-display-a1b2"
+            // Fallback: "slack-reactions-device-{hash}" if device.name is empty/invalid
+            String deviceHash = generateDeviceHash(cfg.device.id);
+            String hashedFallback = "slack-reactions-device-" + deviceHash;
+
+            String hostnameWithHash = cfg.device.name.isEmpty()
+                ? hashedFallback
+                : cfg.device.name + "-" + deviceHash;
+            String hostname = sanitizeHostname(hostnameWithHash, hashedFallback);
+
+            WiFi.setHostname(hostname.c_str());
+            snprintf(logBuf, sizeof(logBuf), "hostname=%s (from: %s)",
+                     hostname.c_str(), cfg.device.name.c_str());
+            logMessage(LOG_DEBUG, "WIFI", "Hostname configured", logBuf);
+
             // Apply TX power: force HIGH or use adaptive (LOW → MEDIUM → HIGH)
             wifi_power_t txPower = wifiPowerState.currentPower;
             const char* powerName = "UNKNOWN";
@@ -2815,6 +2832,123 @@ public:
             if (!isalnum(c) && c != '_' && c != '-') return false;
         }
         return true;
+    }
+
+    /**
+     * Generate a short 4-character hash from device ID for privacy-safe hostname fallback
+     *
+     * Creates a stable, deterministic hash using simple checksum algorithm (no crypto imports).
+     * The hash is consistent across reboots for the same device.id.
+     *
+     * Algorithm:
+     * - Compute 32-bit hash using polynomial rolling hash (multiplier: 31)
+     * - Convert to base-36 (0-9, a-z) for compact representation
+     * - Pad to 4 characters for consistency
+     *
+     * Example: "lilygo_t5_v231_213_1" → "a3f2"
+     *
+     * @param deviceId The device.id string to hash
+     * @return 4-character alphanumeric hash string
+     */
+    static String generateDeviceHash(const String& deviceId) {
+        uint32_t hash = 0;
+        for (size_t i = 0; i < deviceId.length(); i++) {
+            hash = hash * 31 + deviceId.charAt(i);
+        }
+        // Convert to base-36 (0-9, a-z) for short string
+        // 36^4 = 1,679,616 possible combinations (sufficient for collision resistance)
+        String result = String(hash % 1679616, 36);
+
+        // Pad to exactly 4 characters
+        while (result.length() < 4) {
+            result = "0" + result;
+        }
+        return result;
+    }
+
+    /**
+     * Sanitize hostname to comply with RFC 1123 DNS naming conventions
+     *
+     * RFC 1123 Rules:
+     * - Valid characters: a-z, A-Z, 0-9, hyphen (-)
+     * - Must start and end with alphanumeric (not hyphen)
+     * - Maximum length: 63 characters
+     * - Case-insensitive (converted to lowercase for consistency)
+     *
+     * Sanitization Process:
+     * 1. Convert to lowercase
+     * 2. Replace spaces and underscores with hyphens
+     * 3. Remove invalid characters (keep only alphanumeric and hyphens)
+     * 4. Truncate to 63 characters
+     * 5. Remove leading/trailing hyphens
+     * 6. Collapse consecutive hyphens into single hyphen
+     * 7. Fallback to provided fallback string if result is empty/invalid
+     *
+     * @param name Original hostname to sanitize (from config.device.name)
+     * @param fallback Fallback hostname if sanitization produces invalid result
+     * @return RFC 1123 compliant hostname string
+     */
+    static String sanitizeHostname(const String& name, const String& fallback) {
+        String result = name;
+
+        // Step 1: Convert to lowercase
+        result.toLowerCase();
+
+        // Step 2 & 3: Replace spaces/underscores with hyphens, remove invalid chars
+        String cleaned = "";
+        for (size_t i = 0; i < result.length(); i++) {
+            char c = result.charAt(i);
+            if (isalnum(c)) {
+                cleaned += c;
+            } else if (c == ' ' || c == '_' || c == '-') {
+                cleaned += '-';
+            }
+            // All other characters are silently removed
+        }
+        result = cleaned;
+
+        // Step 4: Truncate to 63 characters max
+        if (result.length() > 63) {
+            result = result.substring(0, 63);
+        }
+
+        // Step 5: Remove leading hyphens
+        while (result.length() > 0 && result.charAt(0) == '-') {
+            result = result.substring(1);
+        }
+
+        // Remove trailing hyphens
+        while (result.length() > 0 && result.charAt(result.length() - 1) == '-') {
+            result = result.substring(0, result.length() - 1);
+        }
+
+        // Step 6: Collapse consecutive hyphens
+        String collapsed = "";
+        bool lastWasHyphen = false;
+        for (size_t i = 0; i < result.length(); i++) {
+            char c = result.charAt(i);
+            if (c == '-') {
+                if (!lastWasHyphen) {
+                    collapsed += c;
+                    lastWasHyphen = true;
+                }
+                // Skip consecutive hyphens
+            } else {
+                collapsed += c;
+                lastWasHyphen = false;
+            }
+        }
+        result = collapsed;
+
+        // Step 7: Validate result is non-empty and starts/ends with alphanumeric
+        if (result.length() == 0 ||
+            !isalnum(result.charAt(0)) ||
+            !isalnum(result.charAt(result.length() - 1))) {
+            // Use fallback if result is invalid (recursive sanitization with ultimate fallback)
+            return sanitizeHostname(fallback, "slack-reactions-device");
+        }
+
+        return result;
     }
 
     static bool startProvisioning(bool forcePortal = false) {
