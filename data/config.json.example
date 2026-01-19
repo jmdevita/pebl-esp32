@@ -10,7 +10,11 @@
     "force_high_power": false,
     "escalation_threshold": 3,
     "max_failed_wakes": 20,
-    "_comment": "TX power: By default (false), uses adaptive mode starting at LOW (11dBm) for ~40% WiFi battery savings, auto-escalating to MEDIUM/HIGH if connection fails. Set true to always use HIGH (19.5dBm). After 20 failed wakes, enters low-power fallback mode (60min sleep, retries every 6h)."
+    "seed_networks": [
+      {"ssid": "Home_WiFi", "password": "your_home_password"},
+      {"ssid": "Office_WiFi", "password": "your_office_password"}
+    ],
+    "_comment": "TX power: By default (false), uses adaptive mode starting at LOW (11dBm) for ~40% WiFi battery savings, auto-escalating to MEDIUM/HIGH if connection fails. Set true to always use HIGH (19.5dBm). After 20 failed wakes, enters low-power fallback mode (60min sleep, retries every 6h). seed_networks: Pre-configured WiFi networks that are pinned (never evicted by LRU). Device stores up to 5 networks total. Remove seed_networks array if you want provisioning-only mode."
   },
   "server": {
     "host": "YOUR_SERVER_URL",

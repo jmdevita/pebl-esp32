@@ -30,6 +30,7 @@ void ConfigManager::setDefaults() {
     config.wifi.force_high_power = false;  // Use adaptive power by default
     config.wifi.escalation_threshold = 3;
     config.wifi.max_failed_wakes = 20;
+    config.wifi.seed_networks.clear();  // No seed networks by default (use NVS only)
 
     // Server defaults
     config.server.host = "";  // Must be set in config.json
@@ -150,6 +151,60 @@ bool ConfigManager::loadFromJson(const String& jsonStr) {
         config.wifi.force_high_power = wifi["force_high_power"] | config.wifi.force_high_power;
         config.wifi.escalation_threshold = wifi["escalation_threshold"] | config.wifi.escalation_threshold;
         config.wifi.max_failed_wakes = wifi["max_failed_wakes"] | config.wifi.max_failed_wakes;
+
+        // Parse seed_networks array (pinned WiFi networks)
+        if (wifi["seed_networks"].is<JsonArray>()) {
+            config.wifi.seed_networks.clear();
+            JsonArray seedArray = wifi["seed_networks"].as<JsonArray>();
+
+            // Limit to 5 seed networks to prevent memory issues
+            int seedCount = 0;
+            for (JsonObject seed : seedArray) {
+                if (seedCount >= 5) {
+                    logMessage("WARN", "CONFIG", "Max 5 seed networks allowed, ignoring extras");
+                    break;
+                }
+
+                String ssid = seed["ssid"] | "";
+                String password = seed["password"] | "";
+
+                // Validate SSID (required, max 32 chars per WiFi spec)
+                if (ssid.length() == 0) {
+                    logMessage("WARN", "CONFIG", "Skipping seed network with empty SSID");
+                    continue;
+                }
+                if (ssid.length() > 32) {
+                    char buf[64];
+                    snprintf(buf, sizeof(buf), "ssid_length=%u (max 32)", (unsigned int)ssid.length());
+                    logMessage("WARN", "CONFIG", "Skipping seed network - SSID too long", buf);
+                    continue;
+                }
+
+                // Validate password (max 64 chars per WPA2 spec)
+                if (password.length() > 64) {
+                    char buf[64];
+                    snprintf(buf, sizeof(buf), "password_length=%u (max 64)", (unsigned int)password.length());
+                    logMessage("WARN", "CONFIG", "Skipping seed network - password too long", buf);
+                    continue;
+                }
+
+                WiFiSeedNetwork seedNet;
+                seedNet.ssid = ssid;
+                seedNet.password = password;
+                config.wifi.seed_networks.push_back(seedNet);
+                seedCount++;
+
+                char buf[64];
+                snprintf(buf, sizeof(buf), "ssid=%s", ssid.c_str());
+                logMessage("DEBUG", "CONFIG", "Loaded seed network", buf);
+            }
+
+            if (seedCount > 0) {
+                char buf[32];
+                snprintf(buf, sizeof(buf), "count=%d", seedCount);
+                logMessage("INFO", "CONFIG", "Seed networks loaded", buf);
+            }
+        }
     }
 
     // Parse server section
@@ -307,6 +362,16 @@ String ConfigManager::toJson() {
     wifi["force_high_power"] = config.wifi.force_high_power;
     wifi["escalation_threshold"] = config.wifi.escalation_threshold;
     wifi["max_failed_wakes"] = config.wifi.max_failed_wakes;
+
+    // Serialize seed_networks array (only if non-empty)
+    if (!config.wifi.seed_networks.empty()) {
+        JsonArray seedArray = wifi["seed_networks"].to<JsonArray>();
+        for (const auto& seed : config.wifi.seed_networks) {
+            JsonObject seedObj = seedArray.add<JsonObject>();
+            seedObj["ssid"] = seed.ssid;
+            seedObj["password"] = seed.password;
+        }
+    }
 
     // Server section
     JsonObject server = doc["server"].to<JsonObject>();

@@ -4,9 +4,16 @@
 OTAManager::OTAManager(const String& serverUrl, const String& deviceId)
     : serverUrl(serverUrl), deviceId(deviceId), status(OTAStatus::IDLE) {
 
-    // Get current version from app descriptor
+    // Get current version from APP_VERSION define (set by scripts/set_version.py)
+    // This is more reliable than esp_app_get_description()->version which may
+    // return a git hash if PROJECT_VER isn't properly propagated through PlatformIO
+#ifdef APP_VERSION
+    currentVersion = String(APP_VERSION);
+#else
+    // Fallback to app descriptor if APP_VERSION not defined
     const esp_app_desc_t* app_desc = esp_app_get_description();
     currentVersion = String(app_desc->version);
+#endif
 }
 
 bool OTAManager::checkForUpdate(FirmwareInfo& info) {
@@ -21,8 +28,10 @@ bool OTAManager::checkForUpdate(FirmwareInfo& info) {
         return false;
     }
 
-    // Build full URL with query parameters including display_variant
-    String url = serverUrl + "/api/firmware/version?device_id=" + deviceId + "&display_variant=" + variant;
+    // Build full URL with query parameters including display_variant and current version
+    String url = serverUrl + "/api/firmware/version?device_id=" + deviceId
+                 + "&display_variant=" + variant
+                 + "&current_version=" + currentVersion;
 
     // Create fresh HTTPS client instances
     WiFiClientSecure secureClient;

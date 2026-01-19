@@ -4,6 +4,14 @@
 #include <Arduino.h>
 #include <ArduinoJson.h>
 #include <LittleFS.h>
+#include <vector>
+
+// Seed network structure for pre-configured WiFi networks
+// Defined outside AppConfig to allow proper type referencing
+struct WiFiSeedNetwork {
+    String ssid;       // Max 32 chars (WiFi spec)
+    String password;   // Max 64 chars (WPA2 spec)
+};
 
 // Configuration structure to hold all settings
 struct AppConfig {
@@ -15,14 +23,19 @@ struct AppConfig {
     } device;
 
     // WiFi settings
-    // Note: WiFi credentials (SSID/password) are stored in ESP32 NVS by WiFiManager
-    // and do not need to be in config.json. Provisioning mode handles credential management.
+    // Note: WiFi credentials are stored in ESP32 NVS by WiFiCredentialManager with LRU eviction.
+    // seed_networks in config.json are pinned (never evicted) and merged with NVS on boot.
     struct {
         uint32_t timeout_ms;
         // TX power settings
         bool force_high_power;           // true = always use HIGH (19.5dBm), false = adaptive LOW→MEDIUM→HIGH
         uint8_t escalation_threshold;    // Failures before escalating power (default: 3)
         uint8_t max_failed_wakes;        // Failed wakes before fallback mode (default: 20)
+
+        // Seed networks: Pre-configured WiFi networks from config.json
+        // These are pinned (never evicted by LRU) and merged with NVS credentials on boot.
+        // Max 5 networks total (seeds + NVS combined).
+        std::vector<WiFiSeedNetwork> seed_networks;
     } wifi;
 
     // Server settings

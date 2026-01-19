@@ -1,5 +1,6 @@
 #include <Arduino.h>
 #include <WiFi.h>
+#include <WiFiMulti.h>
 #include <WiFiManager.h>
 #include <WebSocketsClient.h>
 #include <ArduinoJson.h>
@@ -25,6 +26,7 @@
 #include <Fonts/FreeSansBold9pt7b.h>
 #include <Fonts/FreeSansOblique9pt7b.h>
 #include "config/ConfigManager.h"
+#include "wifi/WiFiCredentialManager.h"
 #include "security/SecurityManager.h"
 #include "resilience/ResilienceManager.h"
 #include <mbedtls/base64.h>
@@ -141,7 +143,7 @@ namespace BatteryConstants {
     // Hysteresis prevents oscillation: different thresholds for each direction
     constexpr float USB_HIGH_VOLTAGE_THRESHOLD = 4.05f;    // Battery→USB: Detect while charging (87%+)
     constexpr float USB_TO_BATTERY_THRESHOLD = 4.15f;      // USB→Battery: Require drop to 4.15V
-    constexpr float VOLTAGE_STABILITY_THRESHOLD = 0.002f;  // USB has very low variance (<0.002V²)
+    constexpr float VOLTAGE_STABILITY_THRESHOLD = 0.005f;  // Increased from 0.002V² to account for ADC noise during WiFi (√0.005 = 71mV p-p tolerance)
 
     // LiPo voltage range (MakerFocus specs + Adafruit data)
     constexpr float LIPO_MAX_VOLTAGE = 4.2f;               // Fully charged
@@ -155,8 +157,8 @@ namespace BatteryConstants {
     constexpr unsigned long MAX_BATTERY_RUNTIME_MS = 20000; // 20sec max runtime on battery (allows emoji downloads + WiFi variance)
 
     // ADC configuration
-    constexpr int ADC_SAMPLE_COUNT = 10;                   // Samples for averaging
-    constexpr int ADC_SAMPLE_DELAY_MS = 5;                 // Delay between samples
+    constexpr int ADC_SAMPLE_COUNT = 20;                   // Samples for averaging (increased from 10 for WiFi noise rejection)
+    constexpr int ADC_SAMPLE_DELAY_MS = 10;                // Delay between samples (increased from 5ms for noise settling)
     constexpr float ADC_VOLTAGE_DIVIDER = 2.0f;            // 2:1 voltage divider
     constexpr float ADC_MAX_VOLTAGE = 3.6f;                // ESP32 ADC max voltage
     constexpr int ADC_RESOLUTION = 4095;                   // 12-bit ADC (0-4095)
@@ -202,6 +204,9 @@ namespace {  // Anonymous namespace for internal linkage
     // WebSocket client
     WebSocketsClient webSocket;
 
+    // WiFiMulti for multi-network support (iPhone-like behavior)
+    WiFiMulti wifiMulti;
+
     // Connection state - volatile for ISR safety
     volatile bool wsConnected = false;
 
@@ -215,6 +220,15 @@ namespace {  // Anonymous namespace for internal linkage
     uint8_t registrationErrorCount = 0;
     const uint8_t MAX_REGISTRATION_RETRIES = 3;
     bool registrationFailedPermanently = false;  // Stop reconnecting after max retries
+
+    // OAuth QR code state for device linking flow
+    // When device is not linked to a user, we display a QR code that the user can scan
+    // to complete OAuth and link their Slack account to this device
+    bool showingOAuthQR = false;              // Currently displaying QR code for linking
+    String oauthUrl = "";                     // OAuth URL to encode in QR code
+    unsigned long qrDisplayStartTime = 0;    // When QR code was first displayed
+    const unsigned long QR_RECONNECT_INTERVAL_MS = 60000;   // Check if linked every 60 seconds
+    const unsigned long QR_DISPLAY_TIMEOUT_MS = 600000;     // Give up after 10 minutes
 
     // Connection metrics
     struct ConnectionMetrics {
@@ -263,6 +277,10 @@ adc_cali_handle_t adc_cali_handle = nullptr;
 // Power management state (survives deep sleep)
 RTC_DATA_ATTR unsigned long rtcBatteryModeStartTime = 0;
 RTC_DATA_ATTR bool rtcWasPreviouslyOnBattery = false;
+
+// USB detection state (survives deep sleep for accurate delta detection)
+RTC_DATA_ATTR float rtcLastVoltage = 0.0f;        // Last measured voltage for delta calculation
+RTC_DATA_ATTR bool rtcLastUSBState = false;       // Last known USB power state
 
 // WiFi adaptive power management state (survives deep sleep)
 RTC_DATA_ATTR struct {
@@ -923,14 +941,24 @@ public:
             display->setFont(&FreeSansOblique9pt7b);
             String channelLabel = "From: " + String(channel);
 
+            // Calculate max width for channel label (leave space on left for emoji area)
+            const int16_t leftPadding = 60;  // Match user/message text left edge
+            int16_t channelMaxWidth = display->width() - leftPadding - rightMargin;
+
+            // Truncate channel label to fit available width
+            String truncatedChannel = truncateToFit(channelLabel.c_str(),
+                                                    &FreeSansOblique9pt7b,
+                                                    0,
+                                                    channelMaxWidth);
+
             // Calculate text width to right-align
             int16_t x1, y1;
             uint16_t w, h;
-            display->getTextBounds(channelLabel, 0, 0, &x1, &y1, &w, &h);
+            display->getTextBounds(truncatedChannel, 0, 0, &x1, &y1, &w, &h);
 
             int16_t channelX = display->width() - w - rightMargin;
             display->setCursor(channelX, 92);  // Positioned closer to message content
-            display->print(channelLabel);
+            display->print(truncatedChannel);
 
             // Timestamp at bottom left with smaller font
             display->setFont(nullptr);  // Default small font
@@ -1021,6 +1049,118 @@ public:
         updateDisplayStateAfterFullRefresh();
 
         logMessage(LOG_INFO, "DISPLAY", "Provisioning mode displayed");
+    }
+
+    /**
+     * Display OAuth QR code for device linking.
+     * Shows a QR code that users scan with their phone to complete Slack OAuth
+     * and link their account to this device. Used when device credentials exist
+     * but no user is associated with the device yet.
+     *
+     * @param url The OAuth URL to encode in the QR code (includes device_id and token)
+     */
+    static void showOAuthQRCode(const String& url) {
+        logMessage(LOG_INFO, "DISPLAY", "Showing OAuth QR code for device linking");
+
+        if (!display) return;
+
+        // Determine QR code version based on URL length
+        // OAuth URLs use byte encoding (not alphanumeric) due to special chars like :, /, ?, =
+        // Byte mode capacity at ECC_LOW:
+        //   Version 5 (37x37): 106 bytes max
+        //   Version 6 (41x41): 134 bytes max
+        //
+        // Display constraint: 212x104 pixels, QR starts at Y=22, scale=2
+        // Max QR height at scale 2: (104-22)/2 = 41 modules = Version 6 max
+        // For URLs > 134 bytes, we must show an error (URL too long for display)
+        uint8_t qrVersion;
+        size_t urlLen = url.length();
+        if (urlLen <= 106) {
+            qrVersion = 5;      // 37x37 modules = 74px at scale 2
+        } else if (urlLen <= 134) {
+            qrVersion = 6;      // 41x41 modules = 82px at scale 2 (max for display)
+        } else {
+            // URL too long for QR code that fits on display
+            logMessage(LOG_ERROR, "DISPLAY", "OAuth URL too long for display");
+            char logBuf[64];
+            snprintf(logBuf, sizeof(logBuf), "url_len=%zu max=134", urlLen);
+            logMessage(LOG_ERROR, "DISPLAY", "URL length exceeds display capacity", logBuf);
+            showMessage("Link Device", "URL too long", "Contact admin", "to shorten URL");
+            return;
+        }
+
+        QRCode qrcode;
+        uint8_t qrcodeData[qrcode_getBufferSize(qrVersion)];
+        int8_t qrResult = qrcode_initText(&qrcode, qrcodeData, qrVersion, ECC_LOW, url.c_str());
+
+        if (qrResult != 0) {
+            logMessage(LOG_ERROR, "DISPLAY", "QR code generation failed");
+            showMessage("Link Device", "QR generation failed", "URL too long", "Contact support");
+            return;
+        }
+
+        display->setFullWindow();
+        display->firstPage();
+        do {
+            display->fillScreen(GxEPD_WHITE);
+            display->setTextColor(GxEPD_BLACK);
+
+            // Draw battery and power indicators
+            drawBatteryIndicator();
+            drawPowerStatusIndicator();
+
+            // Title - positioned at top, baseline at Y=14 (text renders above baseline)
+            display->setFont(&FreeSansBold9pt7b);
+            display->setCursor(10, 14);
+            display->print("Link Device");
+
+            // QR Code - positioned on the left side below title
+            // Scale factor: 2 pixels per module for reliable phone scanning
+            // Y position 18 allows Version 6 (41*2=82px) to fit: 18+82=100 < 104 (display height)
+            const uint8_t scale = 2;
+            const int16_t qrX = 5;
+            const int16_t qrY = 18;
+
+            // Draw each QR code module
+            for (uint8_t y = 0; y < qrcode.size; y++) {
+                for (uint8_t x = 0; x < qrcode.size; x++) {
+                    uint16_t color = qrcode_getModule(&qrcode, x, y) ? GxEPD_BLACK : GxEPD_WHITE;
+                    display->fillRect(qrX + (x * scale), qrY + (y * scale), scale, scale, color);
+                }
+            }
+
+            // Instructions on the right side of QR code
+            display->setFont(nullptr);  // Small default font
+            const int16_t textX = qrX + (qrcode.size * scale) + 5;
+            int16_t textY = qrY + 2;
+
+            display->setCursor(textX, textY);
+            display->print("Scan with phone");
+
+            textY += 10;
+            display->setCursor(textX, textY);
+            display->print("to link Slack");
+
+            textY += 14;
+            display->setCursor(textX, textY);
+            display->print("ID:");
+
+            textY += 10;
+            display->setCursor(textX, textY);
+            // Show first 8 characters of device ID for identification
+            String shortId = ConfigManager::getDeviceId().substring(0, 8);
+            display->print(shortId.c_str());
+
+            textY += 14;
+            display->setCursor(textX, textY);
+            display->print("Waiting...");
+
+        } while (display->nextPage());
+
+        // Update display state flags after full refresh
+        updateDisplayStateAfterFullRefresh();
+
+        logMessage(LOG_INFO, "DISPLAY", "OAuth QR code displayed");
     }
 
     /**
@@ -1251,8 +1391,21 @@ void setupADCCalibration() {
     }
 }
 
-BatteryStatus getBatteryStatus() {
+// Battery status cache to avoid excessive ADC sampling (200ms per call)
+// Reuses cached result if called within 1 second
+static BatteryStatus cachedBatteryStatus = {5.0, -1, -1, false, false};
+static unsigned long lastBatteryReadTime = 0;
+
+BatteryStatus getBatteryStatus(bool forceRefresh = false) {
     using namespace BatteryConstants;
+
+    // Return cached value if less than 1 second old (unless forced)
+    unsigned long now = millis();
+    if (!forceRefresh && cachedBatteryStatus.hasBattery &&
+        (unsigned long)(now - lastBatteryReadTime) < 1000) {
+        return cachedBatteryStatus;
+    }
+
     BatteryStatus status = {5.0, -1, -1, false, false};
 
     // Read battery voltage via ADC (LilyGo T5 uses GPIO 35 or 36)
@@ -1338,7 +1491,13 @@ BatteryStatus getBatteryStatus() {
         status.voltage < NO_BATTERY_MIN_VOLTAGE ||
         status.voltage > NO_BATTERY_MAX_VOLTAGE) {
         status.voltage = 5.0;  // Sentinel value for no battery
-        logMessage(LOG_WARN, "POWER", "No battery detected", "");
+        status.hasBattery = false;
+        status.percentage = -1;
+        status.level = -1;
+        status.isUSBPowered = true;  // Must be USB powered if no battery
+        rtcLastUSBState = true;       // Update RTC state for consistency
+        rtcLastVoltage = 0;           // Clear voltage baseline (no valid reading)
+        logMessage(LOG_WARN, "POWER", "No battery detected - assuming USB power", "");
         return status;
     }
 
@@ -1385,49 +1544,159 @@ BatteryStatus getBatteryStatus() {
     bool highVoltage = (pattern_avg >= USB_HIGH_VOLTAGE_THRESHOLD);
     bool stableVoltage = (pattern_variance < VOLTAGE_STABILITY_THRESHOLD);
 
-    // Static state with hysteresis to prevent rapid toggling
-    static bool lastUSBState = false;
+    // Static state for timing (non-persistent)
     static unsigned long lastUSBCheckTime = 0;
-    static unsigned long lastUSBLogTime = 0;
-    unsigned long now = millis();
+    static bool pendingUSBState = false;
+    static int consecutiveStateCount = 0;
 
-    // Only update USB state every 3 seconds (allows voltage to stabilize)
-    if ((unsigned long)(now - lastUSBCheckTime) >= 3000) {
+    // Update USB state every 10 seconds, or immediately on first call (initialization)
+    // After deep sleep, static variables reset to 0, so first call initializes state immediately
+    bool isFirstCall = (lastUSBCheckTime == 0);
+
+    // Calculate voltage delta since last check (detects USB plug/unplug events)
+    // WiFi causes 4-16mV sag, USB unplug causes 50-150mV drop (easily distinguishable)
+    // NOTE: Skip delta on first call to prevent false triggers on wake from sleep
+    float voltageDelta = 0;
+    if (!isFirstCall && rtcLastVoltage > 0) {
+        voltageDelta = pattern_avg - rtcLastVoltage;
+    }
+
+    // Pre-calculate voltage zone and delta indicators for logging and logic
+    bool inHysteresisZone = (pattern_avg >= USB_HIGH_VOLTAGE_THRESHOLD && pattern_avg < USB_TO_BATTERY_THRESHOLD);
+    bool clearlyUSB = (pattern_avg >= USB_TO_BATTERY_THRESHOLD);      // ≥4.15V = definitely USB
+    bool clearlyBattery = (pattern_avg < USB_HIGH_VOLTAGE_THRESHOLD);  // <4.05V = definitely battery
+    bool voltageDrop = (!isFirstCall && voltageDelta < -0.05f);   // Dropped >50mV = USB unplugged
+    bool voltageJump = (!isFirstCall && voltageDelta > 0.10f);    // Jumped >100mV = USB plugged in
+
+    if (isFirstCall || (unsigned long)(now - lastUSBCheckTime) >= 10000) {
         lastUSBCheckTime = now;
 
-        if (lastUSBState) {
-            // Currently USB - switch to battery if voltage drops below threshold AND becomes unstable
-            // In hysteresis zone (4.0-4.15V): stability determines state (USB=stable, Battery=unstable)
-            bool inHysteresisZone = (pattern_avg >= USB_HIGH_VOLTAGE_THRESHOLD && pattern_avg < USB_TO_BATTERY_THRESHOLD);
-            if (inHysteresisZone) {
-                // In zone: stay USB if stable (charging), switch to battery if unstable (unplugged)
-                lastUSBState = stableVoltage;
+        // Determine new USB state using voltage thresholds and delta detection
+        bool newUSBState;
+
+        if (clearlyUSB) {
+            // Above hysteresis zone - definitely USB powered
+            newUSBState = true;
+        } else if (clearlyBattery) {
+            // Below hysteresis zone - definitely battery powered
+            newUSBState = false;
+        } else if (inHysteresisZone) {
+            // In hysteresis zone (4.05-4.15V) - use delta detection + stability
+            if (voltageDrop) {
+                // Detected USB unplug signature (50-150mV drop)
+                newUSBState = false;
+            } else if (voltageJump) {
+                // Detected USB plug-in signature (200-500mV jump)
+                newUSBState = true;
             } else {
-                // Outside zone: simple voltage check
-                lastUSBState = (pattern_avg >= USB_HIGH_VOLTAGE_THRESHOLD);
+                // No clear delta - use stability check as fallback
+                // Note: This is less reliable due to ADC noise during WiFi
+                newUSBState = stableVoltage;
             }
         } else {
-            // Currently battery - require BOTH high voltage AND stability for USB
-            // Stability check works because getBatteryStatus() is called during WiFi activity
-            // Battery voltage sags under WiFi load (unstable), USB stays regulated (stable)
-            lastUSBState = (highVoltage && stableVoltage);
+            // Shouldn't reach here, but default to current state
+            newUSBState = rtcLastUSBState;
+        }
+
+        // On first call (boot/wake), initialize state immediately without confirmation
+        if (isFirstCall) {
+            rtcLastUSBState = newUSBState;
+            pendingUSBState = newUSBState;
+            consecutiveStateCount = 0;
+            rtcLastVoltage = pattern_avg;  // Initialize voltage baseline
+
+            char logBuf[128];
+            snprintf(logBuf, sizeof(logBuf), "initialized (v=%.2fV, zone=%s)",
+                     pattern_avg, inHysteresisZone ? "HYST" : (clearlyUSB ? "USB" : "BATT"));
+            logMessage(LOG_INFO, "POWER",
+                      newUSBState ? "Initial state: USB mode" : "Initial state: Battery mode",
+                      logBuf);
+        }
+        // Asymmetric confirmation logic: fast plug-in, slow unplug
+        else if (newUSBState == pendingUSBState) {
+            consecutiveStateCount++;
+
+            // Battery → USB: Only 1 confirmation needed (10s total, high confidence signal)
+            // USB → Battery: 2 confirmations needed (20s total, prevents WiFi noise oscillation)
+            int requiredConfirmations = (newUSBState == true) ? 1 : 2;
+
+            if (consecutiveStateCount >= requiredConfirmations) {
+                // State confirmed - update RTC state
+                if (rtcLastUSBState != newUSBState) {
+                    char logBuf[128];
+                    snprintf(logBuf, sizeof(logBuf), "confirmed after %d checks (delta=%.3fV, v=%.2fV)",
+                             requiredConfirmations, voltageDelta, pattern_avg);
+                    logMessage(LOG_INFO, "POWER",
+                              newUSBState ? "Switched to USB mode" : "Switched to battery mode",
+                              logBuf);
+                }
+                rtcLastUSBState = newUSBState;
+                consecutiveStateCount = 0;
+            }
+        } else {
+            // State changed - check for high-confidence immediate switch
+            pendingUSBState = newUSBState;
+            consecutiveStateCount = 1;
+
+            // FAST PATH: Immediate switch for clear plug-in events
+            if (newUSBState == true && !rtcLastUSBState) {
+                // Trying to switch to USB - check for high confidence indicators
+                bool largeVoltageIncrease = (voltageDelta > 0.10f);  // Jumped >100mV
+                bool clearlyCharging = (pattern_avg >= 4.15f && stableVoltage);
+
+                if (largeVoltageIncrease || clearlyCharging) {
+                    // High confidence USB connection - switch immediately
+                    rtcLastUSBState = true;
+                    consecutiveStateCount = 0;
+
+                    char logBuf[128];
+                    snprintf(logBuf, sizeof(logBuf),
+                             "immediate (delta=+%.3fV, v=%.2fV, stable=%s)",
+                             voltageDelta, pattern_avg, stableVoltage ? "yes" : "no");
+                    logMessage(LOG_INFO, "POWER", "USB detected - fast path", logBuf);
+                }
+            }
+        }
+
+        // Update voltage baseline for next delta calculation (skip on first call, already set)
+        if (!isFirstCall) {
+            rtcLastVoltage = pattern_avg;
         }
     }
 
+    status.isUSBPowered = rtcLastUSBState;
 
-    status.isUSBPowered = lastUSBState;
+    // Enhanced diagnostic logging - only log on state change or every 60 seconds (reduces spam)
+    static unsigned long lastBatteryLogTime = 0;
+    static bool lastLoggedUSBState = rtcLastUSBState;
+    bool stateChanged = (rtcLastUSBState != lastLoggedUSBState);
+    bool shouldLog = stateChanged || isFirstCall || ((unsigned long)(now - lastBatteryLogTime) >= 60000);
 
-    char logBuf[128];
-    snprintf(logBuf, sizeof(logBuf), "v=%.2f pct=%d%% lvl=%d usb=%s",
-             status.voltage, status.percentage, status.level,
-             status.isUSBPowered ? "yes" : "no");
-    logMessage(LOG_DEBUG, "POWER", "Battery status", logBuf);
+    if (shouldLog) {
+        lastBatteryLogTime = now;
+        lastLoggedUSBState = rtcLastUSBState;
+
+        char logBuf[256];
+        const char* zoneStr = inHysteresisZone ? "HYST" : (clearlyUSB ? "USB" : "BATT");
+        snprintf(logBuf, sizeof(logBuf),
+                 "v=%.3f avg=%.3f var=%.6f delta=%+.3fV pct=%d%% usb=%s stable=%s zone=%s",
+                 status.voltage, pattern_avg, pattern_variance, voltageDelta,
+                 status.percentage,
+                 status.isUSBPowered ? "Y" : "N",
+                 stableVoltage ? "Y" : "N",
+                 zoneStr);
+        logMessage(LOG_DEBUG, "POWER", "Battery status", logBuf);
+    }
+
+    // Cache result and update timestamp
+    cachedBatteryStatus = status;
+    lastBatteryReadTime = now;
 
     return status;
 }
 
 // Single-field accessor wrappers for getBatteryStatus()
-// Use these when you only need one field to avoid unpacking the full struct
+// These now benefit from 1-second caching (fast when called multiple times)
 int getBatteryPercentage() { return getBatteryStatus().percentage; }
 int getBatteryLevel() { return getBatteryStatus().level; }
 bool isUSBPowered() { return getBatteryStatus().isUSBPowered; }
@@ -1994,6 +2263,15 @@ void webSocketEvent(WStype_t type, uint8_t* payload, size_t length) {
             metrics.failedConnections = 0;  // Reset failed counter on successful connection
             registrationErrorCount = 0;  // Reset registration error tracking on successful connection
             registrationFailedPermanently = false;
+
+            // Clear OAuth QR state on successful connection - device linking completed
+            if (showingOAuthQR) {
+                logMessage(LOG_INFO, "WS", "Device linking successful - clearing QR mode");
+                showingOAuthQR = false;
+                oauthUrl = "";
+                qrDisplayStartTime = 0;
+            }
+
             ResilienceManager::markConnectionRestored();  // Track restoration
             ResilienceManager::recordHeartbeat();  // Record initial heartbeat
             const AppConfig& cfg = ConfigManager::getConfig();
@@ -2231,8 +2509,45 @@ void handleWebSocketMessage(const uint8_t* payload, size_t length) {
         snprintf(logBuf, sizeof(logBuf), "code=%s message=\"%s\"", errorCode, errorMsg);
         logMessage(LOG_ERROR, "WS", "Server error", logBuf);
 
-        // Show specific screen for registration errors
-        if (strcmp(errorCode, "DEVICE_NOT_REGISTERED") == 0 || strcmp(errorCode, "DEVICE_NOT_LINKED") == 0) {
+        // Handle DEVICE_NOT_LINKED with QR code display for user-friendly linking
+        // Server sends OAuth URL that user can scan to link their Slack account to this device
+        if (strcmp(errorCode, "DEVICE_NOT_LINKED") == 0) {
+            const AppConfig& cfg = ConfigManager::getConfig();
+
+            // Extract OAuth URL from server response (if provided)
+            const char* serverOAuthUrl = doc["oauth_url"] | "";
+
+            if (serverOAuthUrl[0] != '\0') {
+                // Use the URL provided by server
+                oauthUrl = String(serverOAuthUrl);
+            } else {
+                // Fallback: build URL from config if server didn't provide one
+                String protocol = cfg.server.use_ssl ? "https://" : "http://";
+                oauthUrl = protocol + cfg.server.host;
+                if ((cfg.server.use_ssl && cfg.server.port != 443) ||
+                    (!cfg.server.use_ssl && cfg.server.port != 80)) {
+                    oauthUrl += ":" + String(cfg.server.port);
+                }
+                oauthUrl += "/oauth/authorize?device_id=" + cfg.device.id;
+                oauthUrl += "&token=" + cfg.security.auth_token;
+            }
+
+            // Display QR code for user to scan
+            DisplayManager::showOAuthQRCode(oauthUrl);
+
+            // Enter QR code mode - will poll periodically to check if linking completed
+            showingOAuthQR = true;
+            qrDisplayStartTime = millis();
+            wsConnected = false;
+            webSocket.disconnect();
+
+            logMessage(LOG_INFO, "WS", "Entering OAuth QR mode - waiting for user to link device");
+            return;
+        }
+
+        // Handle DEVICE_NOT_REGISTERED (device credentials not found on server)
+        // This is different from DEVICE_NOT_LINKED - credentials exist but no user associated
+        if (strcmp(errorCode, "DEVICE_NOT_REGISTERED") == 0) {
             const AppConfig& cfg = ConfigManager::getConfig();
 
             registrationErrorCount++;
@@ -2681,6 +2996,33 @@ public:
             }
         }
 
+        // Initialize WiFi credential manager (loads from NVS + merges config.json seeds)
+        if (!WiFiCredentialManager::begin()) {
+            logMessage(LOG_WARN, "WIFI", "Credential manager initialization issue (may be first boot)");
+        }
+
+        // Check if we have any WiFi credentials
+        if (WiFiCredentialManager::getNetworkCount() == 0) {
+            logMessage(LOG_INFO, "WIFI", "No WiFi credentials stored - entering provisioning mode");
+            if (!silent) {
+                DisplayManager::showMessage("WiFi Setup", "No networks saved", "", "Starting portal...");
+            }
+            return startProvisioning();
+        }
+
+        // Populate WiFiMulti with all stored credentials
+        // WiFiMulti automatically connects to the strongest available network
+        wifiMulti = WiFiMulti();  // Reset to clear any previous networks
+        for (const auto& cred : WiFiCredentialManager::getCredentials()) {
+            wifiMulti.addAP(cred.ssid.c_str(), cred.password.c_str());
+            snprintf(logBuf, sizeof(logBuf), "ssid=%s pinned=%s",
+                     cred.ssid.c_str(), cred.isPinned ? "yes" : "no");
+            logMessage(LOG_DEBUG, "WIFI", "Added network to WiFiMulti", logBuf);
+        }
+
+        snprintf(logBuf, sizeof(logBuf), "networks=%d", WiFiCredentialManager::getNetworkCount());
+        logMessage(LOG_INFO, "WIFI", "WiFi credentials loaded", logBuf);
+
         // Try connecting 3 times before entering provisioning mode
         const int maxRetries = 3;
         const uint32_t retryDelay = 5000;  // 5 seconds between retries
@@ -2727,31 +3069,26 @@ public:
                 }
             }
 
-            // WiFi.begin() with no parameters uses credentials stored in ESP32 NVS
-            // These are saved by WiFiManager during provisioning mode
-            WiFi.begin();
-
-            // Set TX power after WiFi.begin() to avoid "Neither AP or STA has been started" warning
+            // Set TX power BEFORE connection attempt for adaptive power savings
+            // Must be set after WiFi.mode(WIFI_STA) but before wifiMulti.run()
             WiFi.setTxPower(txPower);
             snprintf(logBuf, sizeof(logBuf), "tx_power=%s", powerName);
             logMessage(LOG_DEBUG, "WIFI", "Setting TX power", logBuf);
 
-            const uint32_t startTime = millis();
-            while (WiFi.status() != WL_CONNECTED) {
-                if ((unsigned long)(millis() - startTime) > cfg.wifi.timeout_ms) {
-                    logMessage(LOG_WARN, "WIFI", "Connection timeout", logBuf);
-                    break;  // Exit inner loop, will retry
-                }
-                delay(500);
-                Serial.print('.');
-            }
+            // WiFiMulti.run() tries all configured networks and connects to strongest signal
+            // It handles scanning, selection, and connection internally
+            uint8_t status = wifiMulti.run(cfg.wifi.timeout_ms);
 
             // Check if connected
-            if (WiFi.status() == WL_CONNECTED) {
+            if (status == WL_CONNECTED) {
                 int rssi = WiFi.RSSI();
-                snprintf(logBuf, sizeof(logBuf), "ip=%s rssi=%d tx_power=%s",
-                         WiFi.localIP().toString().c_str(), rssi, powerName);
+                String connectedSSID = WiFi.SSID();
+                snprintf(logBuf, sizeof(logBuf), "ip=%s ssid=%s rssi=%d tx_power=%s",
+                         WiFi.localIP().toString().c_str(), connectedSSID.c_str(), rssi, powerName);
                 logMessage(LOG_INFO, "WIFI", "Connected", logBuf);
+
+                // Update lastUsed timestamp for LRU tracking
+                WiFiCredentialManager::updateLastUsed(connectedSSID);
 
                 // Reset adaptive power failures on successful connection (unless forced HIGH)
                 if (!cfg.wifi.force_high_power) {
@@ -3010,8 +3347,8 @@ public:
             DisplayManager::showMessage("Config Saved!", "Processing...");
         });
 
-        // Set timeout for config portal (3 minutes)
-        wm.setConfigPortalTimeout(180);
+        // Set timeout for config portal (10 minutes)
+        wm.setConfigPortalTimeout(600);
 
         // Choose connection method based on context
         bool success;
@@ -3094,10 +3431,28 @@ public:
                 }
             }
 
-            // WiFi connection successful
+            // WiFi connection successful - capture and store credentials for multi-network support
+            String newSSID = WiFi.SSID();
+            String newPass = wm.getWiFiPass();
+
+            // Initialize credential manager if not already done (in case this is first boot)
+            WiFiCredentialManager::begin();
+
+            // Add/update the network in credential storage
+            if (WiFiCredentialManager::addNetwork(newSSID, newPass)) {
+                char credBuf[64];
+                snprintf(credBuf, sizeof(credBuf), "ssid=%s stored=yes", newSSID.c_str());
+                logMessage(LOG_INFO, "WIFI", "Network credentials saved", credBuf);
+            } else {
+                // This can happen if all 5 slots are pinned (seed networks)
+                char credBuf[64];
+                snprintf(credBuf, sizeof(credBuf), "ssid=%s stored=no (all slots pinned)", newSSID.c_str());
+                logMessage(LOG_WARN, "WIFI", "Network works but not persisted", credBuf);
+            }
+
             char logBuf[128];
             snprintf(logBuf, sizeof(logBuf), "ip=%s ssid=%s",
-                     WiFi.localIP().toString().c_str(), WiFi.SSID().c_str());
+                     WiFi.localIP().toString().c_str(), newSSID.c_str());
             logMessage(LOG_INFO, "WIFI", "Provisioned and connected", logBuf);
 
             DisplayManager::showMessage("WiFi Connected!",
@@ -3109,12 +3464,24 @@ public:
             return true;
 
         } else {
-            // Timeout or user cancelled
-            logMessage(LOG_ERROR, "WIFI", "Provisioning timeout or cancelled");
-            DisplayManager::showMessage("Setup Timeout", "Restarting...");
-            delay(2000);
-            ESP.restart();
-            return false;
+            // Timeout or user cancelled - enter deep sleep to save battery
+            // User must power cycle to retry provisioning
+            logMessage(LOG_ERROR, "WIFI", "Provisioning timeout - entering deep sleep");
+            DisplayManager::showMessage(
+                "WiFi Setup Timeout",
+                "Turn off device",
+                "and back on",
+                "to try again"
+            );
+            delay(3000);  // Give user time to read message
+
+            // Hibernate display to preserve message and reduce power draw
+            if (display) {
+                display->hibernate();
+            }
+
+            esp_deep_sleep_start();  // Sleep indefinitely (no wake timer)
+            return false;  // Never reached
         }
     }
 
@@ -3176,6 +3543,41 @@ private:
 
     static void handleWebSocketReconnection() {
         const AppConfig& cfg = ConfigManager::getConfig();
+
+        // Handle OAuth QR code mode - special reconnection behavior while waiting for user to link
+        // Device displays QR code and periodically checks if linking has been completed
+        if (showingOAuthQR) {
+            const uint32_t now = millis();
+            const uint32_t elapsed = now - qrDisplayStartTime;
+
+            // Timeout after 10 minutes - enter deep sleep to conserve battery
+            // User can wake device by pressing button to try again
+            if (elapsed > QR_DISPLAY_TIMEOUT_MS) {
+                logMessage(LOG_INFO, "WS", "OAuth QR timeout - entering deep sleep");
+                showingOAuthQR = false;
+                oauthUrl = "";
+                qrDisplayStartTime = 0;
+
+                DisplayManager::showMessage("Link timeout", "Scan QR to link",
+                                          "Device sleeping", "Press button to wake");
+                delay(2000);
+                enterDeepSleep(10);  // Sleep for 10 minutes, will reset QR state on wake
+                return;
+            }
+
+            // Reconnect every 60 seconds to check if user has completed linking
+            if (now - lastReconnect > QR_RECONNECT_INTERVAL_MS) {
+                lastReconnect = now;
+                logMessage(LOG_INFO, "WS", "Checking if device is now linked...");
+
+                // Disconnect cleanly before reconnect attempt
+                webSocket.disconnect();
+                delay(100);
+
+                connectWebSocket();
+            }
+            return;
+        }
 
         // Don't reconnect if registration permanently failed
         if (registrationFailedPermanently) {
@@ -3723,24 +4125,19 @@ void loop() {
     if ((unsigned long)(now - lastPowerCheck) > 10000) {
         lastPowerCheck = now;
 
-        // Call getBatteryStatus() ONCE and reuse the result (avoid multiple 50ms ADC samplings)
-        BatteryStatus batteryStatus = getBatteryStatus();
+        // Force fresh battery read (no caching) for 10-second power check
+        BatteryStatus batteryStatus = getBatteryStatus(true);
         bool isOnBattery = !batteryStatus.isUSBPowered;
         int batteryPct = batteryStatus.percentage;
 
-        // Track USB connection state to detect when USB is plugged in (regardless of sleep_enabled)
-        // This ensures the low battery warning flag resets properly even when sleep is disabled
-        static bool lastPowerWasOnBattery = false;
-
         // Detect USB reconnection and reset warning flag
-        if (!isOnBattery && lastPowerWasOnBattery) {
+        // Uses rtcLastUSBState which is updated inside getBatteryStatus()
+        static bool lastKnownUSBState = rtcLastUSBState;  // Track for edge detection
+        if (batteryStatus.isUSBPowered && !lastKnownUSBState) {
             hasShownLowBatteryWarning = false;  // Reset warning flag when USB is plugged in
-            lastPowerWasOnBattery = false;
             logMessage(LOG_INFO, "POWER", "USB connected - low battery warning flag reset");
-        } else if (isOnBattery && !lastPowerWasOnBattery) {
-            lastPowerWasOnBattery = true;
-            logMessage(LOG_DEBUG, "POWER", "Switched to battery power");
         }
+        lastKnownUSBState = batteryStatus.isUSBPowered;
 
         // Check for critically low battery (regardless of sleep_enabled)
         // This ensures users are warned even if they've disabled sleep
@@ -4019,10 +4416,11 @@ void performOTAUpdate() {
 
     // Download and install with progress callback
     bool success = otaManager->downloadAndInstall(info, [](size_t current, size_t total) {
-        // Progress callback - update display every 10%
+        // Progress callback - update display every 20%
+        // (E-paper refresh is slow, so fewer updates = faster install)
         static int lastPercent = -1;
         int percent = (current * 100) / total;
-        if (percent != lastPercent && percent % 10 == 0) {
+        if (percent != lastPercent && percent % 20 == 0) {
             lastPercent = percent;
             char buf[32];
             snprintf(buf, sizeof(buf), "%d%%", percent);
