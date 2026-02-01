@@ -59,8 +59,7 @@ struct AppConfig {
     // Security settings
     struct {
         String auth_token;     // Device authentication token (two-factor auth with device_id)
-        bool use_aes;
-        String aes_key;
+        String encryption;     // "ecdh" (default, auto key generation) or "none"
     } security;
 
     // Power management settings

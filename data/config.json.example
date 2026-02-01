@@ -27,9 +27,8 @@
   },
   "security": {
     "auth_token": "YOUR_AUTH_TOKEN_FROM_ADMIN_PANEL",
-    "use_aes": true,
-    "aes_key": "YOUR_32_BYTE_HEX_AES_KEY_HERE",
-    "_comment": "auth_token REQUIRED for device authentication (two-factor: device_id + token). Contact your server administrator to generate a token."
+    "encryption": "ecdh",
+    "_comment": "auth_token REQUIRED for device authentication (two-factor: device_id + token). encryption: 'ecdh' (default, auto key generation) or 'none'. ECDH P-256 keys auto-generated on first boot and stored in NVS."
   },
   "power": {
     "sleep_enabled": true,

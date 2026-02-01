@@ -43,8 +43,7 @@ void ConfigManager::setDefaults() {
 
     // Security defaults
     config.security.auth_token = "";  // Must be set in config.json
-    config.security.use_aes = false;
-    config.security.aes_key = "";
+    config.security.encryption = "ecdh";
 
     // Power defaults
     config.power.sleep_enabled = true;
@@ -226,8 +225,17 @@ bool ConfigManager::loadFromJson(const String& jsonStr) {
     if (doc["security"].is<JsonObject>()) {
         JsonObject security = doc["security"];
         config.security.auth_token = security["auth_token"] | config.security.auth_token;
-        config.security.use_aes = security["use_aes"] | config.security.use_aes;
-        config.security.aes_key = security["aes_key"] | config.security.aes_key;
+
+        // New format: "encryption" field ("ecdh" or "none")
+        if (security["encryption"].is<const char*>()) {
+            config.security.encryption = security["encryption"].as<String>();
+        } else if (security["use_aes"].is<bool>()) {
+            // Migration from old config: use_aes:true → "ecdh", use_aes:false → "none"
+            // Old aes_key field is silently ignored (ECDH uses NVS-generated keys)
+            config.security.encryption = security["use_aes"].as<bool>() ? "ecdh" : "none";
+            logMessage("INFO", "CONFIG", "Migrated use_aes to encryption format",
+                      config.security.encryption.c_str());
+        }
     }
 
     // Parse power section
@@ -387,8 +395,7 @@ String ConfigManager::toJson() {
     // Security section
     JsonObject security = doc["security"].to<JsonObject>();
     security["auth_token"] = config.security.auth_token;
-    security["use_aes"] = config.security.use_aes;
-    security["aes_key"] = config.security.aes_key;
+    security["encryption"] = config.security.encryption;
 
     // Logging section
     JsonObject logging = doc["logging"].to<JsonObject>();

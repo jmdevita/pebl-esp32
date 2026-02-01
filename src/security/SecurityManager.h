@@ -2,47 +2,68 @@
 #define SECURITY_MANAGER_H
 
 #include <Arduino.h>
-#include <mbedtls/aes.h>
-#include <mbedtls/base64.h>
 
-// AES-256 CBC encryption/decryption manager
+// mbedtls 3.x hides struct members behind MBEDTLS_PRIVATE() macro.
+// This define allows direct access to ecp_keypair members (grp, d, Q)
+// which is needed for ECDH operations. Standard pattern for ESP32 projects.
+#define MBEDTLS_ALLOW_PRIVATE_ACCESS
+
+#include <mbedtls/ecp.h>
+#include <mbedtls/ecdh.h>
+#include <mbedtls/pk.h>
+#include <mbedtls/aes.h>
+#include <mbedtls/md.h>
+#include <mbedtls/base64.h>
+#include <mbedtls/entropy.h>
+#include <mbedtls/ctr_drbg.h>
+
+// ECDH P-256 encryption manager
+// Device generates a keypair on first boot, stores the private key in NVS,
+// and uploads the public key to the server. Per-message decryption uses
+// ECDH + HKDF-SHA256 + AES-256-CBC to match the server's wire format.
 class SecurityManager {
 private:
-    static mbedtls_aes_context aesContext;
+    static uint8_t privateKey[32];   // P-256 private scalar, loaded from NVS
     static bool initialized;
-    static uint8_t aesKey[32];  // 256-bit key
-    static uint8_t aesIV[16];   // 128-bit IV
+    static bool keyUploaded;         // Persisted in NVS
 
     // Logging helper
     static void logMessage(const char* level, const char* module, const char* message, const char* details = nullptr);
 
     // PKCS7 padding helpers
-    static void addPadding(uint8_t* data, size_t dataLen, size_t blockSize);
     static size_t removePadding(uint8_t* data, size_t dataLen);
 
-public:
-    // Initialize with AES key (base64 encoded)
-    static bool init(const String& base64Key);
+    // NVS operations
+    static bool loadKeyFromNVS();
+    static bool generateAndSaveKey();
 
-    // Cleanup
+    // Derive PEM-encoded public key from private scalar
+    // Returns number of bytes written (including null terminator), or 0 on failure
+    static size_t derivePublicKeyPEM(char* buf, size_t bufSize);
+
+    // HKDF-SHA256: extract-then-expand with salt=NULL, info="aes-key", length=32
+    static bool hkdfSHA256(const uint8_t* ikm, size_t ikmLen, uint8_t* okm, size_t okmLen);
+
+public:
+    // Load key from NVS or generate on first boot
+    static bool init();
+
+    // Zero private key from RAM
     static void cleanup();
 
-    // Decrypt AES-256-CBC encrypted data (base64 encoded)
-    static String decrypt(const String& encryptedBase64, const String& ivBase64);
+    // Decrypt ECDH envelope JSON: {"encrypted": b64, "ephemeral_public_key": PEM, "iv": b64}
+    static String decryptECDH(const String& envelopeJson);
 
-    // Decrypt AES-256-CBC encrypted data (hex encoded)
-    static String decryptHex(const String& encryptedHex, const String& ivHex);
+    // Get PEM-encoded public key for display/debugging
+    static String getPublicKeyPEM();
 
-    // Encrypt data (for testing)
-    static String encrypt(const String& plaintext, String& ivBase64Out);
+    // Upload public key to server via multipart POST to /upload
+    static bool uploadPublicKey(const String& serverBaseUrl, const String& authToken, const String& deviceId);
 
-    // Generate random IV
-    static void generateIV(uint8_t* iv);
+    // Check if key has been uploaded to server (persisted in NVS)
+    static bool isKeyUploaded() { return keyUploaded; }
 
-    // Test encryption/decryption round trip
-    static bool selfTest();
-
-    // Check if security is enabled
+    // Check if ECDH keypair is loaded and ready
     static bool isEnabled() { return initialized; }
 };
 

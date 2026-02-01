@@ -2276,54 +2276,17 @@ void webSocketEvent(WStype_t type, uint8_t* payload, size_t length) {
             ResilienceManager::recordHeartbeat();  // Record initial heartbeat
             const AppConfig& cfg = ConfigManager::getConfig();
 
-            // Declare hexKey outside if block so it's accessible throughout the case
-            String hexKey = "";
-
-            // Send registration message with AES key if encryption is enabled
-            if (cfg.security.use_aes && !cfg.security.aes_key.isEmpty()) {
-                // Convert base64 key to hex for server
-                size_t keyLen = 32;
-                unsigned char decodedKey[32];
-                size_t outLen;
-
-                // Decode base64 to bytes
-                int ret = mbedtls_base64_decode(decodedKey, keyLen, &outLen,
-                                               (const unsigned char*)cfg.security.aes_key.c_str(),
-                                               cfg.security.aes_key.length());
-
-                if (ret == 0 && outLen == 32) {
-                    // Convert bytes to hex string
-                    char hexBuf[3];
-                    for (int i = 0; i < 32; i++) {
-                        snprintf(hexBuf, sizeof(hexBuf), "%02x", decodedKey[i]);
-                        hexKey += hexBuf;
-                    }
-                } else {
-                    logMessage(LOG_WARN, "WS", "Failed to decode AES key for registration");
-                }
-            }
-
             // Send registration message with auth_token (mandatory two-factor auth)
-            // This must be sent immediately after WebSocket connection for authentication
+            // ECDH public key is uploaded separately via /upload endpoint (not in registration)
             JsonDocument regDoc;
             regDoc["type"] = "register";
             regDoc["device_type"] = "esp32_eink";
             regDoc["auth_token"] = cfg.security.auth_token;
 
-            // Include AES key if available
-            if (!hexKey.isEmpty()) {
-                regDoc["aes_key"] = hexKey;
-            }
-
             String regMsg;
             serializeJson(regDoc, regMsg);
             webSocket.sendTXT(regMsg);
-
-            if (!hexKey.isEmpty()) {
-                logMessage(LOG_INFO, "WS", "Sent registration with auth_token and AES key");
-            } else {
-                logMessage(LOG_INFO, "WS", "Sent registration with auth_token");
-            }
+            logMessage(LOG_INFO, "WS", "Sent registration with auth_token");
 
             // Check for firmware updates on first WebSocket connection (power-on boot only)
             // Timing: Performed here instead of immediately after WiFi connect ensures DNS has fully
@@ -2345,7 +2308,7 @@ void webSocketEvent(WStype_t type, uint8_t* payload, size_t length) {
 
             // Only show "Connected!" message if NOT waking from sleep (preserve reaction display)
             if (!justWokeFromSleep) {
-                DisplayManager::showMessage("", "Connected!", "Waiting for Reactions..", "", cfg.security.use_aes);
+                DisplayManager::showMessage("", "Connected!", "Waiting for Reactions..", "", SecurityManager::isEnabled());
             } else {
                 logMessage(LOG_INFO, "WS", "Connected after wake - preserving display");
                 justWokeFromSleep = false;  // Clear flag after first connection
@@ -2391,36 +2354,21 @@ void handleWebSocketMessage(const uint8_t* payload, size_t length) {
 
     JsonDocument doc;
 
-    // Check if message starts with "AES:" prefix (encrypted hex format)
+    // Try to parse as JSON first (both ECDH envelopes and plain messages are JSON)
     String message((const char*)payload, length);
-    if (message.startsWith("AES:") && SecurityManager::isEnabled()) {
-        logMessage(LOG_DEBUG, "SECURITY", "Received AES encrypted hex message");
 
-        // Remove "AES:" prefix
-        String hexData = message.substring(4);
+    // Detect ECDH encrypted envelope: JSON with "ephemeral_public_key" field
+    if (SecurityManager::isEnabled() && message.indexOf("ephemeral_public_key") > 0) {
+        logMessage(LOG_DEBUG, "SECURITY", "Received ECDH encrypted message");
 
-        // Hex string should be: IV (32 hex chars = 16 bytes) + ciphertext
-        if (hexData.length() < 32) {
-            logMessage(LOG_ERROR, "SECURITY", "Encrypted message too short");
-            return;
-        }
-
-        // Extract IV (first 32 hex chars)
-        String ivHex = hexData.substring(0, 32);
-        // Extract ciphertext (remaining hex chars)
-        String ciphertextHex = hexData.substring(32);
-
-        snprintf(logBuf, sizeof(logBuf), "iv_len=%d cipher_len=%d", ivHex.length(), ciphertextHex.length());
-        logMessage(LOG_DEBUG, "SECURITY", "Parsing encrypted data", logBuf);
-
-        // Decrypt the message using hex format
-        String decrypted = SecurityManager::decryptHex(ciphertextHex, ivHex);
+        // Decrypt the ECDH envelope (JSON → ECDH + HKDF + AES-256-CBC → plaintext JSON)
+        String decrypted = SecurityManager::decryptECDH(message);
         if (decrypted.isEmpty()) {
-            logMessage(LOG_ERROR, "SECURITY", "Failed to decrypt message");
+            logMessage(LOG_ERROR, "SECURITY", "Failed to decrypt ECDH message");
             return;
         }
 
-        logMessage(LOG_DEBUG, "SECURITY", "Message decrypted successfully");
+        logMessage(LOG_DEBUG, "SECURITY", "ECDH message decrypted successfully");
 
         // Parse decrypted JSON
         DeserializationError error = deserializeJson(doc, decrypted);
@@ -2726,11 +2674,8 @@ void processSerialCommand(const String& command) {
             } else if (key == "server.host") {
                 cfg.server.host = value;
                 updated = true;
-            } else if (key == "security.use_aes") {
-                cfg.security.use_aes = (value == "true" || value == "1");
-                updated = true;
-            } else if (key == "security.aes_key") {
-                cfg.security.aes_key = value;
+            } else if (key == "security.encryption") {
+                cfg.security.encryption = value;
                 updated = true;
             }
 
@@ -2771,92 +2716,20 @@ void processSerialCommand(const String& command) {
             logMessage(LOG_ERROR, "CONFIG", "Failed to reload configuration");
         }
     }
-    else if (command.startsWith("TEST:AES:ENCRYPT:")) {
-        String plaintext = command.substring(17);
+    else if (command.startsWith("TEST:ECDH:STATUS")) {
+        char buf[256];
+        snprintf(buf, sizeof(buf), "enabled=%s key_uploaded=%s",
+                 SecurityManager::isEnabled() ? "true" : "false",
+                 SecurityManager::isKeyUploaded() ? "true" : "false");
+        logMessage(LOG_TEST, "ECDH", "Status", buf);
 
-        if (!SecurityManager::isEnabled()) {
-            logMessage(LOG_TEST, "AES", "Not configured");
-            return;
+        if (SecurityManager::isEnabled()) {
+            String pem = SecurityManager::getPublicKeyPEM();
+            if (!pem.isEmpty()) {
+                logMessage(LOG_TEST, "ECDH", "Public key PEM:");
+                logMessage(LOG_TEST, "ECDH", pem.c_str());
+            }
         }
-
-        String ivB64;
-        String encrypted = SecurityManager::encrypt(plaintext, ivB64);
-
-        if (!encrypted.isEmpty()) {
-            char buf[256];
-            snprintf(buf, sizeof(buf), "plain_len=%d enc_len=%d",
-                     plaintext.length(), encrypted.length());
-            logMessage(LOG_TEST, "AES", "Encrypted", buf);
-
-            logMessage(LOG_TEST, "AES", "IV", ivB64.c_str());
-            logMessage(LOG_TEST, "AES", "Data", encrypted.c_str());
-        } else {
-            logMessage(LOG_ERROR, "AES", "Encryption failed");
-        }
-    }
-    else if (command.startsWith("TEST:AES:DECRYPT:")) {
-        String params = command.substring(17);
-        int colonPos = params.indexOf(':');
-
-        if (colonPos < 1) {
-            logMessage(LOG_ERROR, "AES", "Invalid format, use TEST:AES:DECRYPT:iv:data");
-            return;
-        }
-
-        String iv = params.substring(0, colonPos);
-        String data = params.substring(colonPos + 1);
-
-        if (!SecurityManager::isEnabled()) {
-            logMessage(LOG_TEST, "AES", "Not configured");
-            return;
-        }
-
-        String decrypted = SecurityManager::decrypt(data, iv);
-        if (!decrypted.isEmpty()) {
-            char buf[128];
-            snprintf(buf, sizeof(buf), "dec_len=%d", decrypted.length());
-            logMessage(LOG_TEST, "AES", "Decrypted", buf);
-            logMessage(LOG_TEST, "AES", "Plaintext", decrypted.c_str());
-        } else {
-            logMessage(LOG_ERROR, "AES", "Decryption failed");
-        }
-    }
-    else if (command.startsWith("TEST:AES:SELF")) {
-        if (!SecurityManager::isEnabled()) {
-            logMessage(LOG_TEST, "AES", "Not configured");
-            return;
-        }
-
-        bool passed = SecurityManager::selfTest();
-        logMessage(LOG_TEST, "AES", passed ? "Self-test passed" : "Self-test failed");
-    }
-    else if (command.startsWith("TEST:AES:MSG:")) {
-        String json = command.substring(13);
-
-        if (!SecurityManager::isEnabled()) {
-            logMessage(LOG_TEST, "AES", "Not configured, injecting unencrypted");
-            injectTestMessage(json);
-            return;
-        }
-
-        String ivB64;
-        String encrypted = SecurityManager::encrypt(json, ivB64);
-
-        if (encrypted.isEmpty()) {
-            logMessage(LOG_ERROR, "AES", "Failed to encrypt test message");
-            return;
-        }
-
-        JsonDocument wrapper;
-        wrapper["encrypted"] = true;
-        wrapper["iv"] = ivB64;
-        wrapper["data"] = encrypted;
-
-        String wrappedJson;
-        serializeJson(wrapper, wrappedJson);
-
-        logMessage(LOG_TEST, "AES", "Injecting encrypted message");
-        injectTestMessage(wrappedJson);
     }
     else if (command.startsWith("TEST:RESILIENCE")) {
         String status = ResilienceManager::getHealthStatus();
@@ -3757,22 +3630,15 @@ void setup() {
         logMessage(LOG_INFO, "DISPLAY", "Preserving display state on wake from sleep");
     }
 
-    // Initialize security if AES key is configured
-    if (cfg.security.use_aes && !cfg.security.aes_key.isEmpty()) {
-        if (SecurityManager::init(cfg.security.aes_key)) {
-            logMessage(LOG_INFO, "SYSTEM", "AES-256 encryption enabled");
-
-            // Run self-test
-            if (SecurityManager::selfTest()) {
-                logMessage(LOG_INFO, "SYSTEM", "AES self-test passed");
-            } else {
-                logMessage(LOG_WARN, "SYSTEM", "AES self-test failed");
-            }
+    // Initialize ECDH encryption if configured
+    if (cfg.security.encryption == "ecdh") {
+        if (SecurityManager::init()) {
+            logMessage(LOG_INFO, "SYSTEM", "ECDH P-256 encryption enabled");
         } else {
-            logMessage(LOG_ERROR, "SYSTEM", "Failed to initialize AES encryption");
+            logMessage(LOG_ERROR, "SYSTEM", "Failed to initialize ECDH encryption");
         }
     } else {
-        logMessage(LOG_INFO, "SYSTEM", "AES encryption disabled");
+        logMessage(LOG_INFO, "SYSTEM", "Encryption disabled (mode=none)");
     }
 
     // Initialize resilience manager with heartbeat settings
@@ -4018,6 +3884,21 @@ void setup() {
             logMessage(LOG_DEBUG, "TIME", "Using RTC time", timeBuf);
         }
 
+        // Upload ECDH public key to server if not yet uploaded
+        // Must happen after WiFi connect but before WebSocket (server needs key to encrypt messages)
+        if (SecurityManager::isEnabled() && !SecurityManager::isKeyUploaded()) {
+            String serverUrl = String(cfg.server.use_ssl ? "https://" : "http://") + cfg.server.host;
+            if ((cfg.server.use_ssl && cfg.server.port != 443) ||
+                (!cfg.server.use_ssl && cfg.server.port != 80)) {
+                serverUrl += ":" + String(cfg.server.port);
+            }
+            if (SecurityManager::uploadPublicKey(serverUrl, cfg.security.auth_token, cfg.device.id)) {
+                logMessage(LOG_INFO, "SYSTEM", "ECDH public key uploaded to server");
+            } else {
+                logMessage(LOG_WARN, "SYSTEM", "ECDH key upload failed - will retry next boot");
+            }
+        }
+
         // Small delay before WebSocket connection
         delay(2000);
         SlackNetworkManager::connectWebSocket();
@@ -4184,7 +4065,7 @@ void loop() {
                         DisplayManager::drawBatteryIndicator();
                         DisplayManager::drawPowerStatusIndicator();
                         // Redraw lock icon if encryption enabled
-                        if (cfg.security.use_aes && !cfg.security.aes_key.isEmpty()) {
+                        if (SecurityManager::isEnabled()) {
                             DisplayManager::drawLockIcon();
                         }
                     } while (display->nextPage());
@@ -4236,7 +4117,7 @@ void loop() {
                         DisplayManager::drawBatteryIndicator();
                         DisplayManager::drawPowerStatusIndicator();  // Shows nothing on USB
                         // Redraw lock icon if encryption enabled
-                        if (cfg.security.use_aes && !cfg.security.aes_key.isEmpty()) {
+                        if (SecurityManager::isEnabled()) {
                             DisplayManager::drawLockIcon();
                         }
                     } while (display->nextPage());
@@ -4401,7 +4282,7 @@ void performOTAUpdate() {
 
     // Show update message on display
     if (display) {
-        DisplayManager::showMessage("Firmware Update", "Downloading...", "Please wait");
+        DisplayManager::showMessage("Firmware Update", "Checking...", "Please wait");
     }
 
     // Get firmware info
@@ -4414,7 +4295,16 @@ void performOTAUpdate() {
         return;
     }
 
+    // Show version being installed
+    logMessage(LOG_INFO, "OTA", "Downloading version", info.version.c_str());
+    if (display) {
+        char versionMsg[64];
+        snprintf(versionMsg, sizeof(versionMsg), "Downloading v%s", info.version.c_str());
+        DisplayManager::showMessage("Firmware Update", versionMsg, "Please wait");
+    }
+
     // Download and install with progress callback
+    // Plain function pointer (no captures) — OTA API requires raw function pointer
     bool success = otaManager->downloadAndInstall(info, [](size_t current, size_t total) {
         // Progress callback - update display every 20%
         // (E-paper refresh is slow, so fewer updates = faster install)
@@ -4427,9 +4317,7 @@ void performOTAUpdate() {
             logMessage(LOG_INFO, "OTA", "Download progress", buf);
 
             if (display) {
-                char progressMsg[64];
-                snprintf(progressMsg, sizeof(progressMsg), "Installing... %d%%", percent);
-                DisplayManager::showMessage("Firmware Update", progressMsg, "Please wait");
+                DisplayManager::showMessage("Firmware Update", buf, "Please wait");
             }
         }
     });
@@ -4437,7 +4325,9 @@ void performOTAUpdate() {
     if (success) {
         logMessage(LOG_INFO, "OTA", "Firmware update successful - rebooting");
         if (display) {
-            DisplayManager::showMessage("Update Complete", "Rebooting...");
+            char completeMsg[64];
+            snprintf(completeMsg, sizeof(completeMsg), "v%s installed", info.version.c_str());
+            DisplayManager::showMessage("Update Complete", completeMsg, "Rebooting...");
         }
         delay(2000);
         ESP.restart();  // Reboot to new firmware
