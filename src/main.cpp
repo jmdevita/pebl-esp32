@@ -3530,7 +3530,11 @@ void setup() {
     metrics.startTime = millis();
 
     Serial.println(F("\n\n========================================"));
-    Serial.println(F("ESP32 Slack Reactions Client v2.0"));
+#ifdef APP_VERSION
+    Serial.println(F("ESP32 Slack Reactions Client v" APP_VERSION));
+#else
+    Serial.println(F("ESP32 Slack Reactions Client"));
+#endif
     Serial.println(F("========================================"));
 
     // Check wake reason
@@ -3624,7 +3628,11 @@ void setup() {
 
     // Show boot screen only on power-on, not on wake from deep sleep
     if (!isWakeFromSleep) {
-        DisplayManager::showMessage("Slack Reactions", "Starting...", cfg.device.name, "v2.0");
+#ifdef APP_VERSION
+        DisplayManager::showMessage("Slack Reactions", "Starting...", cfg.device.name, "v" APP_VERSION);
+#else
+        DisplayManager::showMessage("Slack Reactions", "Starting...", cfg.device.name, "");
+#endif
     } else {
         // On wake from sleep, preserve display state (e-paper retains image without power)
         logMessage(LOG_INFO, "DISPLAY", "Preserving display state on wake from sleep");
