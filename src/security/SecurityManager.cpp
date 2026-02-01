@@ -530,24 +530,9 @@ bool SecurityManager::uploadPublicKey(const String& serverBaseUrl, const String&
 
     logMessage("INFO", "SECURITY", "Uploading ECDH public key to server");
 
-    // Build multipart form data
+    // Build multipart form data (file only — token/name/key_type go as query params)
     String boundary = "----ESP32ECDHKeyUpload";
     String body = "";
-
-    // Field: token
-    body += "--" + boundary + "\r\n";
-    body += "Content-Disposition: form-data; name=\"token\"\r\n\r\n";
-    body += authToken + "\r\n";
-
-    // Field: name
-    body += "--" + boundary + "\r\n";
-    body += "Content-Disposition: form-data; name=\"name\"\r\n\r\n";
-    body += deviceId + "\r\n";
-
-    // Field: key_type
-    body += "--" + boundary + "\r\n";
-    body += "Content-Disposition: form-data; name=\"key_type\"\r\n\r\n";
-    body += "ECDH-P256\r\n";
 
     // File: public key PEM
     body += "--" + boundary + "\r\n";
@@ -558,8 +543,9 @@ bool SecurityManager::uploadPublicKey(const String& serverBaseUrl, const String&
     // End boundary
     body += "--" + boundary + "--\r\n";
 
-    // Send HTTP POST
-    String uploadUrl = serverBaseUrl + "/upload";
+    // Server expects token, name, key_type as query parameters (not form fields)
+    String uploadUrl = serverBaseUrl + "/upload?token=" + authToken
+                     + "&name=" + deviceId + "&key_type=ECDH-P256";
     HTTPClient http;
     WiFiClientSecure client;
     client.setInsecure();  // Server cert validation handled at TLS layer by server URL trust
