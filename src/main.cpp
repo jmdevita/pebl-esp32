@@ -322,6 +322,8 @@ void injectTestMessage(const String& jsonPayload);
 void checkForFirmwareUpdate();
 void performOTAUpdate();
 bool isDeviceIdle();
+void enterDeepSleep(uint32_t sleep_minutes);
+void enterPairingMode();
 
 // ============================================================================
 // Display State Helper
@@ -1161,6 +1163,60 @@ public:
         updateDisplayStateAfterFullRefresh();
 
         logMessage(LOG_INFO, "DISPLAY", "OAuth QR code displayed");
+    }
+
+    /**
+     * Display self-service pairing code on e-paper.
+     * Shows a human-readable 8-character code (e.g., "ABCD-1234") that the user
+     * enters in Slack to link their account to this device. Used when auth_token
+     * is empty (self-service provisioning flow).
+     *
+     * @param pairingCode The 8-character pairing code with hyphen (e.g., "ABCD-1234")
+     * @param deviceId The device ID to display for identification
+     */
+    static void showPairingCode(const String& pairingCode, const String& deviceId) {
+        logMessage(LOG_INFO, "DISPLAY", "Showing pairing code for device linking");
+
+        if (!display) return;
+
+        display->setFullWindow();
+        display->firstPage();
+        do {
+            display->fillScreen(GxEPD_WHITE);
+            display->setTextColor(GxEPD_BLACK);
+
+            // Draw battery indicator in top-right
+            drawBatteryIndicator();
+            drawPowerStatusIndicator();
+
+            // Title: "Pair Your Device"
+            display->setFont(&FreeSans9pt7b);
+            display->setCursor(10, 30);
+            display->print("Pair Your Device");
+
+            // Pairing code (large, prominent)
+            display->setFont(&FreeSansBold9pt7b);
+            display->setCursor(10, 55);
+            display->print(pairingCode);
+
+            // Instructions
+            display->setFont(&FreeSans9pt7b);
+            display->setCursor(10, 75);
+            display->print("Enter code in Slack");
+
+            // Device ID (truncated to fit on 212px wide display)
+            display->setFont(nullptr);  // Small default font for device ID
+            String idLabel = "ID: " + deviceId.substring(0, 20);
+            display->setCursor(10, 95);
+            display->print(idLabel.c_str());
+
+            display->setFont(&FreeSans9pt7b);  // Restore font
+        } while (display->nextPage());
+
+        // Update display state flags after full refresh
+        updateDisplayStateAfterFullRefresh();
+
+        logMessage(LOG_INFO, "DISPLAY", "Pairing code displayed");
     }
 
     /**
@@ -2040,6 +2096,344 @@ void updateEstimatedTime() {
     char logBuf[80];
     snprintf(logBuf, sizeof(logBuf), "utc_time=%lld source=ESP32_RTC", (long long)currentTime);
     logMessage(LOG_DEBUG, "TIME", "Updated time from RTC", logBuf);
+}
+
+// ============================================================================
+// Self-Service Pairing
+// ============================================================================
+// When auth_token is empty, the device enters pairing mode:
+// 1. Requests a pairing code from the server
+// 2. Displays the code on e-paper for the user to enter in Slack
+// 3. Polls the server until the code is claimed or expires
+// 4. On success, saves the auth_token to config.json and returns to normal boot
+
+struct PairingRequestResult {
+    bool success;
+    int httpCode;
+    String sessionId;
+    String pairingCode;
+    int expiresIn;
+    String error;
+};
+
+struct PairingStatusResult {
+    bool success;
+    int httpCode;
+    String status;      // "pending", "claimed", "expired"
+    String authToken;   // Present when status == "claimed"
+};
+
+/**
+ * Build the base server URL from config (protocol + host + optional non-default port).
+ * Reusable helper matching the pattern used by timezone, ECDH upload, and OTA.
+ */
+static String buildServerUrl() {
+    const AppConfig& cfg = ConfigManager::getConfig();
+    String protocol = cfg.server.use_ssl ? "https://" : "http://";
+    String url = protocol + cfg.server.host;
+    if ((cfg.server.use_ssl && cfg.server.port != 443) ||
+        (!cfg.server.use_ssl && cfg.server.port != 80)) {
+        url += ":" + String(cfg.server.port);
+    }
+    return url;
+}
+
+/**
+ * Request a pairing code from the server.
+ * POST /api/pairing/request?device_id={id}&device_type=esp32_eink&firmware_version={ver}
+ *
+ * Returns PairingRequestResult with session_id and pairing_code on success,
+ * or httpCode/error on failure (403 = not registered, 429 = rate limited).
+ */
+static PairingRequestResult requestPairingCode() {
+    const AppConfig& cfg = ConfigManager::getConfig();
+    PairingRequestResult result = {};
+
+    WiFiClientSecure secureClient;
+    secureClient.setInsecure();  // Cloudflare tunnel compatibility (matches OTA/timezone pattern)
+
+    HTTPClient http;
+    http.setTimeout(10000);
+
+    String url = buildServerUrl() + "/api/pairing/request";
+    url += "?device_id=" + cfg.device.id;
+    url += "&device_type=esp32_eink";
+#ifdef APP_VERSION
+    url += "&firmware_version=" + String(APP_VERSION);
+#else
+    url += "&firmware_version=unknown";
+#endif
+
+    char logBuf[128];
+    snprintf(logBuf, sizeof(logBuf), "url=%s", url.c_str());
+    logMessage(LOG_INFO, "PAIRING", "Requesting pairing code", logBuf);
+
+    http.begin(secureClient, url);
+    http.addHeader("Content-Type", "application/json");
+
+    // POST with empty body (all params are in query string)
+    result.httpCode = http.POST("");
+
+    if (result.httpCode == 200 || result.httpCode == 201) {
+        String response = http.getString();
+        http.end();
+
+        JsonDocument doc;
+        DeserializationError error = deserializeJson(doc, response);
+        if (error) {
+            snprintf(logBuf, sizeof(logBuf), "error=%s", error.c_str());
+            logMessage(LOG_ERROR, "PAIRING", "JSON parse error", logBuf);
+            result.error = "JSON parse error";
+            return result;
+        }
+
+        result.success = true;
+        result.sessionId = doc["session_id"].as<String>();
+        result.pairingCode = doc["pairing_code"].as<String>();
+        result.expiresIn = doc["expires_in"] | 600;
+
+        snprintf(logBuf, sizeof(logBuf), "code=%s session=%s expires=%ds",
+                 result.pairingCode.c_str(),
+                 result.sessionId.substring(0, 8).c_str(),
+                 result.expiresIn);
+        logMessage(LOG_INFO, "PAIRING", "Pairing code received", logBuf);
+    } else {
+        String response = http.getString();
+        http.end();
+
+        snprintf(logBuf, sizeof(logBuf), "http_code=%d", result.httpCode);
+        logMessage(LOG_WARN, "PAIRING", "Pairing request failed", logBuf);
+
+        // Try to extract error message from response
+        // Server returns {"error": "..."} for pairing failures (400, 403, 429)
+        JsonDocument doc;
+        if (deserializeJson(doc, response) == DeserializationError::Ok) {
+            result.error = doc["error"].as<String>();
+        }
+        if (result.error.isEmpty()) {
+            result.error = "HTTP " + String(result.httpCode);
+        }
+    }
+
+    return result;
+}
+
+/**
+ * Poll the pairing status for a given session.
+ * GET /api/pairing/status/{session_id}
+ *
+ * Returns PairingStatusResult with status ("pending", "claimed", "expired")
+ * and auth_token when status is "claimed".
+ */
+static PairingStatusResult pollPairingStatus(const String& sessionId) {
+    PairingStatusResult result = {};
+
+    WiFiClientSecure secureClient;
+    secureClient.setInsecure();
+
+    HTTPClient http;
+    http.setTimeout(10000);
+
+    String url = buildServerUrl() + "/api/pairing/status/" + sessionId;
+
+    http.begin(secureClient, url);
+    result.httpCode = http.GET();
+
+    if (result.httpCode == 200) {
+        String response = http.getString();
+        http.end();
+
+        JsonDocument doc;
+        DeserializationError error = deserializeJson(doc, response);
+        if (error) {
+            char logBuf[64];
+            snprintf(logBuf, sizeof(logBuf), "error=%s", error.c_str());
+            logMessage(LOG_ERROR, "PAIRING", "Status JSON parse error", logBuf);
+            return result;
+        }
+
+        result.success = true;
+        result.status = doc["status"].as<String>();
+
+        if (result.status == "claimed" && doc["auth_token"]) {
+            result.authToken = doc["auth_token"].as<String>();
+        }
+
+        char logBuf[64];
+        snprintf(logBuf, sizeof(logBuf), "status=%s", result.status.c_str());
+        logMessage(LOG_DEBUG, "PAIRING", "Poll result", logBuf);
+    } else {
+        http.end();
+        char logBuf[64];
+        snprintf(logBuf, sizeof(logBuf), "http_code=%d", result.httpCode);
+        logMessage(LOG_WARN, "PAIRING", "Status poll failed", logBuf);
+    }
+
+    return result;
+}
+
+/**
+ * Enter self-service pairing mode.
+ * Called from setup() when auth_token is empty. Orchestrates the full flow:
+ * request code → display code → poll until claimed/expired → save auth_token.
+ *
+ * On success: saves auth_token to config.json and returns (setup() continues).
+ * On failure/timeout: shows error message and enters deep sleep (never returns).
+ */
+void enterPairingMode() {
+    const AppConfig& cfg = ConfigManager::getConfig();
+
+    // Battery vs USB timeout: conserve battery power during interactive pairing
+    const unsigned long PAIRING_TIMEOUT_BATTERY_MS = 120000;   // 2 minutes on battery
+    const unsigned long PAIRING_TIMEOUT_USB_MS = 600000;       // 10 minutes on USB (matches server CODE_TTL)
+    const unsigned long POLL_INTERVAL_MS = 5000;               // Poll every 5 seconds
+    const int MAX_CODE_RETRIES = 2;                            // Retry with new code up to 2 times on expiry
+
+    bool onBattery = !isUSBPowered();
+    unsigned long timeoutMs = onBattery ? PAIRING_TIMEOUT_BATTERY_MS : PAIRING_TIMEOUT_USB_MS;
+
+    char logBuf[128];
+    snprintf(logBuf, sizeof(logBuf), "power=%s timeout=%lums",
+             onBattery ? "battery" : "usb", timeoutMs);
+    logMessage(LOG_INFO, "PAIRING", "Starting pairing mode", logBuf);
+
+    int codeRetries = 0;
+
+    while (codeRetries <= MAX_CODE_RETRIES) {
+        // Step 1: Request a pairing code
+        PairingRequestResult codeResult = requestPairingCode();
+
+        if (!codeResult.success) {
+            if (codeResult.httpCode == 403) {
+                // Device not registered on server
+                logMessage(LOG_WARN, "PAIRING", "Device not registered on server");
+                DisplayManager::showMessage(
+                    "Setup Required",
+                    "Register device on",
+                    "server admin panel",
+                    "ID: " + cfg.device.id.substring(0, 18)
+                );
+                delay(3000);
+                enterDeepSleep(10);  // Sleep 10 minutes and retry
+                return;  // Never reached
+            } else if (codeResult.httpCode == 429) {
+                // Rate limited
+                logMessage(LOG_WARN, "PAIRING", "Rate limited by server");
+                DisplayManager::showMessage(
+                    "Rate Limited",
+                    "Too many attempts",
+                    "Try again later",
+                    ""
+                );
+                delay(3000);
+                enterDeepSleep(10);
+                return;
+            } else {
+                // Network error or unexpected status
+                snprintf(logBuf, sizeof(logBuf), "http=%d error=%s",
+                         codeResult.httpCode, codeResult.error.c_str());
+                logMessage(LOG_WARN, "PAIRING", "Server unreachable or error", logBuf);
+                DisplayManager::showMessage(
+                    "Server Error",
+                    "Cannot reach server",
+                    "Check connection",
+                    ""
+                );
+                delay(3000);
+                enterDeepSleep(5);  // Sleep 5 minutes
+                return;
+            }
+        }
+
+        // Step 2: Display the pairing code
+        DisplayManager::showPairingCode(codeResult.pairingCode, cfg.device.id);
+
+        // Step 3: Poll until claimed, expired, or timeout
+        unsigned long pollStart = millis();
+        int networkErrors = 0;
+        const int MAX_NETWORK_ERRORS = 3;
+
+        while ((millis() - pollStart) < timeoutMs) {
+            delay(POLL_INTERVAL_MS);
+
+            PairingStatusResult status = pollPairingStatus(codeResult.sessionId);
+
+            if (!status.success) {
+                networkErrors++;
+                snprintf(logBuf, sizeof(logBuf), "network_errors=%d/%d",
+                         networkErrors, MAX_NETWORK_ERRORS);
+                logMessage(LOG_WARN, "PAIRING", "Poll network error", logBuf);
+                if (networkErrors >= MAX_NETWORK_ERRORS) {
+                    logMessage(LOG_ERROR, "PAIRING", "Too many network errors during polling");
+                    DisplayManager::showMessage(
+                        "Connection Lost",
+                        "Network errors",
+                        "Retrying later...",
+                        ""
+                    );
+                    delay(3000);
+                    enterDeepSleep(5);
+                    return;
+                }
+                continue;
+            }
+
+            // Reset network error counter on successful poll
+            networkErrors = 0;
+
+            if (status.status == "claimed") {
+                // Pairing successful - save auth_token to config
+                logMessage(LOG_INFO, "PAIRING", "Pairing successful! Saving auth_token");
+
+                AppConfig& mutableCfg = ConfigManager::getMutableConfig();
+                mutableCfg.security.auth_token = status.authToken;
+
+                if (ConfigManager::save()) {
+                    logMessage(LOG_INFO, "PAIRING", "Auth token saved to config.json");
+                } else {
+                    logMessage(LOG_ERROR, "PAIRING", "Failed to save auth token to config.json");
+                    // Continue anyway - token is in memory for this boot session
+                }
+
+                DisplayManager::showMessage(
+                    "Paired!",
+                    "Device linked",
+                    "Starting up...",
+                    ""
+                );
+                delay(2000);
+
+                // SSL/TLS cleanup delay before subsequent HTTPS requests
+                delay(1000);
+                return;  // Return to setup() to continue normal boot
+            }
+
+            if (status.status == "expired") {
+                logMessage(LOG_INFO, "PAIRING", "Pairing code expired");
+                break;  // Break inner poll loop to retry with new code
+            }
+
+            // status == "pending" → continue polling
+        }
+
+        // If we exit the poll loop without claiming, the code expired or we timed out
+        codeRetries++;
+        if (codeRetries <= MAX_CODE_RETRIES) {
+            snprintf(logBuf, sizeof(logBuf), "retry=%d/%d", codeRetries, MAX_CODE_RETRIES);
+            logMessage(LOG_INFO, "PAIRING", "Requesting new pairing code", logBuf);
+        }
+    }
+
+    // Exhausted all retries
+    logMessage(LOG_WARN, "PAIRING", "Pairing timed out after all retries");
+    DisplayManager::showMessage(
+        "Pairing Timeout",
+        "Code expired",
+        "Will retry on wake",
+        ""
+    );
+    delay(3000);
+    enterDeepSleep(5);  // Sleep 5 minutes then retry pairing on next boot
 }
 
 /**
@@ -3839,6 +4233,20 @@ void setup() {
         // HTTPS requests (especially SSL handshake) will fail if DNS isn't ready
         logMessage(LOG_DEBUG, "NETWORK", "Waiting for DNS resolver to stabilize");
         delay(2000);  // 2 seconds for DNS to fully initialize
+
+        // Self-service pairing: If auth_token is empty, enter pairing mode.
+        // Pairing requests a code from the server, displays it on e-paper, and polls
+        // until the user enters the code in Slack. On success, auth_token is saved to
+        // config.json and execution continues. On failure/timeout, device deep sleeps.
+        if (cfg.security.auth_token.isEmpty()) {
+            logMessage(LOG_INFO, "PAIRING", "No auth_token configured - entering pairing mode");
+            enterPairingMode();
+            // If we reach here, pairing succeeded and auth_token is saved.
+            // Re-read config reference since auth_token was updated via getMutableConfig().
+            // The existing cfg reference (const&) already points to the same AppConfig object,
+            // so it reflects the updated auth_token without needing to reload.
+            logMessage(LOG_INFO, "PAIRING", "Pairing complete - continuing normal boot");
+        }
 
         // Timezone sync logic (after WiFi connected)
         bool isPowerOnBoot = (wakeup_reason == ESP_SLEEP_WAKEUP_UNDEFINED);

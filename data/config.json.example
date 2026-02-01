@@ -26,9 +26,9 @@
     "rotation": 1
   },
   "security": {
-    "auth_token": "YOUR_AUTH_TOKEN_FROM_ADMIN_PANEL",
+    "auth_token": "",
     "encryption": "ecdh",
-    "_comment": "auth_token REQUIRED for device authentication (two-factor: device_id + token). encryption: 'ecdh' (default, auto key generation) or 'none'. ECDH P-256 keys auto-generated on first boot and stored in NVS."
+    "_comment": "auth_token: Leave empty for self-service pairing (device displays a code to enter in Slack). Or set manually from admin panel for pre-provisioned devices. encryption: 'ecdh' (default, auto key generation) or 'none'. ECDH P-256 keys auto-generated on first boot and stored in NVS."
   },
   "power": {
     "sleep_enabled": true,
