@@ -89,6 +89,20 @@ public:
     bool checkBootValidation();
 
     /**
+     * Save pre-update version info to NVS before reboot.
+     * Called by downloadAndInstall() before returning success.
+     */
+    void savePendingUpdate(const String& oldVersion, const String& newVersion);
+
+    /**
+     * Report successful OTA update to server after boot validation.
+     * Reads saved versions from NVS, POSTs to /api/firmware/stats,
+     * and clears NVS entries on success.
+     * @return true if report sent successfully (or no pending report)
+     */
+    bool reportUpdateSuccess();
+
+    /**
      * Get current OTA status
      */
     OTAStatus getStatus() const { return status; }

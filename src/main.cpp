@@ -3930,6 +3930,15 @@ void setup() {
             logMessage(LOG_INFO, "OTA", "Boot validation successful - new firmware marked as valid");
         }
 
+        // Report successful OTA update to server so Slack Home shows current version.
+        // Called unconditionally: if the POST failed on first boot after OTA,
+        // NVS entries persist and this retries on every subsequent boot until it succeeds.
+        if (otaManager->reportUpdateSuccess()) {
+            logMessage(LOG_INFO, "OTA", "Update success reported to server");
+        } else {
+            logMessage(LOG_WARN, "OTA", "Failed to report update success (will retry next boot)");
+        }
+
         // Firmware update check occurs automatically on first WebSocket connection (power-on boot only)
         // See WStype_CONNECTED handler for implementation. Deferred timing ensures DNS stability.
     }

@@ -1,5 +1,6 @@
 #include "OTAManager.h"
 #include "config/ConfigManager.h"
+#include <Preferences.h>
 
 OTAManager::OTAManager(const String& serverUrl, const String& deviceId)
     : serverUrl(serverUrl), deviceId(deviceId), status(OTAStatus::IDLE) {
@@ -297,6 +298,10 @@ bool OTAManager::downloadAndInstall(const FirmwareInfo& info,
         return false;
     }
 
+    // Save version info to NVS before reboot
+    // After reboot, reportUpdateSuccess() reads these and reports to server
+    savePendingUpdate(currentVersion, info.version);
+
     status = OTAStatus::SUCCESS;
 
     // Device will reboot after this
@@ -417,4 +422,81 @@ bool OTAManager::checkBootValidation() {
     }
 
     return false;
+}
+
+void OTAManager::savePendingUpdate(const String& oldVersion, const String& newVersion) {
+    Preferences prefs;
+    prefs.begin("ota", false);  // read-write
+    prefs.putString("old_ver", oldVersion);
+    prefs.putString("new_ver", newVersion);
+    prefs.end();
+    Serial.printf("[OTA] Saved pending update: %s → %s\n", oldVersion.c_str(), newVersion.c_str());
+}
+
+bool OTAManager::reportUpdateSuccess() {
+    Preferences prefs;
+    prefs.begin("ota", true);  // read-only
+    String oldVersion = prefs.getString("old_ver", "");
+    String newVersion = prefs.getString("new_ver", "");
+    prefs.end();
+
+    // No pending update to report
+    if (oldVersion.isEmpty() || newVersion.isEmpty()) {
+        return true;
+    }
+
+    // Guard against rollback: if the current firmware doesn't match the expected
+    // new version, the OTA likely failed and the device rolled back. Clear stale
+    // NVS data instead of falsely reporting success.
+    if (currentVersion != newVersion) {
+        Serial.printf("[OTA] Version mismatch: running %s but NVS says %s — likely rolled back, clearing\n",
+                      currentVersion.c_str(), newVersion.c_str());
+        Preferences clearPrefs;
+        clearPrefs.begin("ota", false);
+        clearPrefs.remove("old_ver");
+        clearPrefs.remove("new_ver");
+        clearPrefs.end();
+        return true;
+    }
+
+    Serial.printf("[OTA] Reporting update success: %s → %s\n",
+                  oldVersion.c_str(), newVersion.c_str());
+
+    // Build JSON payload matching server's POST /api/firmware/stats schema
+    JsonDocument doc;
+    doc["device_id"] = deviceId;
+    doc["old_version"] = oldVersion;
+    doc["new_version"] = newVersion;
+    doc["status"] = "success";
+
+    String payload;
+    serializeJson(doc, payload);
+
+    // POST to /api/firmware/stats
+    WiFiClientSecure secureClient;
+    HTTPClient httpClient;
+    secureClient.setInsecure();  // Same TLS approach as other OTA requests
+
+    String url = serverUrl + "/api/firmware/stats";
+    httpClient.begin(secureClient, url);
+    httpClient.addHeader("Content-Type", "application/json");
+    httpClient.setTimeout(10000);
+
+    int httpCode = httpClient.POST(payload);
+    httpClient.end();
+
+    if (httpCode == 200) {
+        Serial.println("[OTA] Update success reported to server");
+        // Clear NVS entries now that server has recorded the update
+        Preferences clearPrefs;
+        clearPrefs.begin("ota", false);  // read-write
+        clearPrefs.remove("old_ver");
+        clearPrefs.remove("new_ver");
+        clearPrefs.end();
+        return true;
+    } else {
+        // Non-critical failure — NVS entries persist and we'll retry on next reboot
+        Serial.printf("[OTA] Failed to report update success: HTTP %d\n", httpCode);
+        return false;
+    }
 }
