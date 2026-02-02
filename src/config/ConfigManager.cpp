@@ -20,7 +20,7 @@ void ConfigManager::logMessage(const char* level, const char* module, const char
 
 void ConfigManager::setDefaults() {
     // Device defaults
-    config.device.id = "esp32-default";
+    config.device.id = "";
     config.device.name = "ESP32 Device";
     config.device.display_variant = "";  // Must be set in config.json for OTA updates
 
@@ -138,6 +138,20 @@ bool ConfigManager::loadFromJson(const String& jsonStr) {
     if (doc["device"].is<JsonObject>()) {
         JsonObject device = doc["device"];
         config.device.id = device["id"] | config.device.id;
+
+        // Auto-generate device ID from hardware eFuse MAC if not manually set.
+        // The eFuse MAC is factory-burned and unique per chip, producing a deterministic
+        // 12-char lowercase hex ID (e.g., "a1b2c3d4e5f6") on every boot.
+        // No save back to config.json — keeps the file clean so a manually set ID always wins.
+        if (config.device.id.isEmpty() || config.device.id == "esp32-default") {
+            uint64_t mac = ESP.getEfuseMac();
+            char hwId[13];
+            snprintf(hwId, sizeof(hwId), "%04x%08x",
+                     (uint16_t)(mac >> 32), (uint32_t)mac);
+            config.device.id = String(hwId);
+            logMessage("INFO", "CONFIG", "Device ID auto-generated from hardware MAC", config.device.id.c_str());
+        }
+
         config.device.name = device["name"] | config.device.name;
         config.device.display_variant = device["display_variant"] | config.device.display_variant;
     }

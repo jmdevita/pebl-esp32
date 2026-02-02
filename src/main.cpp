@@ -3599,8 +3599,8 @@ public:
 
         // Add informational HTML text above the field
         WiFiManagerParameter custom_html_text(
-            "<p><small>Change Device ID only if instructed by support for security recovery. "
-            "Leave unchanged for normal WiFi setup.</small></p>"
+            "<p><small>&#9888; Device ID is auto-generated from hardware. "
+            "Changing it will require re-registering with your admin and re-pairing.</small></p>"
         );
 
         // Add parameters to WiFiManager (will appear in portal)
