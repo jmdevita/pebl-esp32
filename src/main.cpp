@@ -2118,6 +2118,7 @@ struct PairingRequestResult {
 
 struct PairingStatusResult {
     bool success;
+    bool rateLimited;   // Server returned 429 — caller should back off
     int httpCode;
     String status;      // "pending", "claimed", "expired"
     String authToken;   // Present when status == "claimed"
@@ -2262,6 +2263,11 @@ static PairingStatusResult pollPairingStatus(const String& sessionId) {
         char logBuf[64];
         snprintf(logBuf, sizeof(logBuf), "status=%s", result.status.c_str());
         logMessage(LOG_DEBUG, "PAIRING", "Poll result", logBuf);
+    } else if (result.httpCode == 429) {
+        http.end();
+        // Server rate limited — caller should increase poll interval
+        result.rateLimited = true;
+        logMessage(LOG_WARN, "PAIRING", "Rate limited by server (429)");
     } else {
         http.end();
         char logBuf[64];
@@ -2286,7 +2292,7 @@ void enterPairingMode() {
     // Battery vs USB timeout: conserve battery power during interactive pairing
     const unsigned long PAIRING_TIMEOUT_BATTERY_MS = 120000;   // 2 minutes on battery
     const unsigned long PAIRING_TIMEOUT_USB_MS = 600000;       // 10 minutes on USB (matches server CODE_TTL)
-    const unsigned long POLL_INTERVAL_MS = 5000;               // Poll every 5 seconds
+    unsigned long pollIntervalMs = 5000;                        // Poll every 5 seconds (mutable for 429 backoff)
     const int MAX_CODE_RETRIES = 2;                            // Retry with new code up to 2 times on expiry
 
     bool onBattery = !isUSBPowered();
@@ -2354,9 +2360,17 @@ void enterPairingMode() {
         const int MAX_NETWORK_ERRORS = 3;
 
         while ((millis() - pollStart) < timeoutMs) {
-            delay(POLL_INTERVAL_MS);
+            delay(pollIntervalMs);
 
             PairingStatusResult status = pollPairingStatus(codeResult.sessionId);
+
+            if (status.rateLimited) {
+                // Back off: double the poll interval, capped at 30s
+                pollIntervalMs = min(pollIntervalMs * 2, 30000UL);
+                snprintf(logBuf, sizeof(logBuf), "new_interval=%lums", pollIntervalMs);
+                logMessage(LOG_WARN, "PAIRING", "Rate limited, backing off", logBuf);
+                continue;
+            }
 
             if (!status.success) {
                 networkErrors++;
