@@ -1194,20 +1194,30 @@ public:
             display->setCursor(10, 30);
             display->print("Pair Your Device");
 
-            // Pairing code (large, prominent)
+            // Pairing code in outlined box for visual prominence
             display->setFont(&FreeSansBold9pt7b);
-            display->setCursor(10, 55);
+            int16_t tx, ty;
+            uint16_t tw, th;
+            display->getTextBounds(pairingCode.c_str(), 0, 0, &tx, &ty, &tw, &th);
+            const int boxPad = 6;
+            const int boxX = 8;
+            const int boxY = 38;
+            const int boxW = tw + boxPad * 2;
+            const int boxH = th + boxPad * 2;
+            display->drawRect(boxX, boxY, boxW, boxH, GxEPD_BLACK);
+            display->setCursor(boxX + boxPad - tx, boxY + boxPad - ty);
             display->print(pairingCode);
 
-            // Instructions
+            // Instructions (positioned below the box)
+            int instrY = boxY + boxH + 14;
             display->setFont(&FreeSans9pt7b);
-            display->setCursor(10, 75);
+            display->setCursor(10, instrY);
             display->print("Enter code in Slack");
 
             // Device ID (truncated to fit on 212px wide display)
             display->setFont(nullptr);  // Small default font for device ID
             String idLabel = "ID: " + deviceId.substring(0, 20);
-            display->setCursor(10, 95);
+            display->setCursor(10, instrY + 16);
             display->print(idLabel.c_str());
 
             display->setFont(&FreeSans9pt7b);  // Restore font
@@ -2899,6 +2909,42 @@ void handleWebSocketMessage(const uint8_t* payload, size_t length) {
 
             logMessage(LOG_INFO, "WS", "Entering OAuth QR mode - waiting for user to link device");
             return;
+        }
+
+        // Handle TRIAL_EXPIRED — 7-day trial has ended, user needs to purchase activation key
+        // Server sends purchase_url where user can buy a key using their device_id
+        if (strcmp(errorCode, "TRIAL_EXPIRED") == 0) {
+            const AppConfig& cfg = ConfigManager::getConfig();
+
+            // Extract purchase URL from server response (fallback to hardcoded default)
+            const char* purchaseUrl = doc["purchase_url"] | "";
+            String purchaseDisplay;
+            if (purchaseUrl[0] != '\0') {
+                purchaseDisplay = String(purchaseUrl);
+            } else {
+                purchaseDisplay = "See purchase info";
+            }
+
+            // Display 4-line trial expiry message with purchase URL and device ID
+            String line1 = "Trial Expired";
+            String line2 = "Purchase key at:";
+            String line3 = purchaseDisplay;
+            String line4 = String("ID: ") + (deviceId[0] ? deviceId : cfg.device.id.c_str());
+            DisplayManager::showMessage(line1, line2, line3, line4);
+
+            // Trial expiry is not transient — user must purchase a key before device works again
+            registrationFailedPermanently = true;
+            wsConnected = false;
+            webSocket.disconnect();
+
+            logMessage(LOG_INFO, "WS", "Trial expired - entering 60-minute deep sleep",
+                       (String("purchase_url=") + purchaseDisplay).c_str());
+
+            // Deep sleep for 60 minutes (longer than 10-min error sleep since trial expiry isn't transient)
+            // On wake: counter resets, device retries. If user purchased key, connection succeeds.
+            delay(2000);  // Show message for 2 seconds before sleeping
+            enterDeepSleep(60);  // 60 minutes
+            // Never returns from deep sleep
         }
 
         // Handle DEVICE_NOT_REGISTERED (device credentials not found on server)

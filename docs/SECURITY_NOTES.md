@@ -1,28 +1,37 @@
-# Security Considerations
+# Security Notes
 
-## AES-256 Encryption Implementation
+## ECDH P-256 Encryption
 
-The ESP32 client supports AES-256 encryption for message transmission. While functional, the current implementation has known limitations:
+The ESP32 client uses Elliptic Curve Diffie-Hellman (ECDH) P-256 for end-to-end message encryption (default, recommended).
 
-### Current Approach
-- ESP32 sends AES key to server during WebSocket handshake
-- Server stores key in database and uses it for message encryption
-- Key automatically updates when changed on device
+### How It Works
+1. Device generates an ECDH P-256 keypair on first boot (hardware RNG)
+2. Private key stored in NVS — never leaves the device
+3. Public key uploaded to server via authenticated HTTPS
+4. Server encrypts each message with a fresh ephemeral key (ECDH + HKDF-SHA256 + AES-256-CBC)
+5. Device decrypts using its private key and the per-message ephemeral public key
 
-### Security Limitations
-1. **Key Transmission**: Symmetric key is transmitted (over TLS, but still not ideal)
-2. **Server-Side Storage**: Server has access to encryption keys
-3. **No Forward Secrecy**: Historical traffic could be decrypted if TLS is compromised
-4. **Limited Authentication**: No device-specific authentication beyond device ID
+This provides **forward secrecy** — each message uses a unique ephemeral key, so compromising the device key cannot decrypt past messages.
 
-### Risk Assessment
-- **Personal Use**: Current implementation is adequate for non-sensitive data (Slack reactions)
-- **Production Use**: Consider implementing proper key exchange (ECDH, RSA-wrapped keys, or pre-shared keys with derivation)
+### Configuration
+```json
+{ "security": { "encryption": "ecdh" } }
+```
+Set to `"none"` to disable (not recommended).
 
-### Potential Improvements
-- Implement Diffie-Hellman key exchange
-- Use RSA to wrap AES keys before transmission
-- Add device authentication with HMAC
-- Implement key rotation with key IDs
+## Device Authentication
 
-For this project's use case (displaying Slack reactions), the current implementation provides reasonable protection against casual interception while maintaining simplicity.
+Two-factor: `device_id` (auto-generated from ESP32 eFuse MAC) + `auth_token` (obtained via self-service pairing or admin pre-provisioning). Both required for all server communication.
+
+## Pairing Security
+
+- 8-character code, 10-minute TTL, one-time use
+- Server-side rate limiting with exponential backoff on 429
+- Battery-aware timeouts (2 min battery, 10 min USB)
+
+## OTA Firmware Security
+
+- SHA-256 hash verification
+- ECDSA P-256 signature verification (tamper protection)
+- Dual OTA partition with automatic rollback on failed boot
+- HTTPS transport
