@@ -1029,7 +1029,7 @@ public:
             display->setCursor(textX, textY);
             display->print(ssid.c_str());
 
-            textY += 15;
+            textY += 14;
             display->setCursor(textX, textY);
             display->print("Open browser:");
 
@@ -1037,13 +1037,9 @@ public:
             display->setCursor(textX, textY);
             display->print(ip.c_str());
 
-            textY += 15;
+            textY += 14;
             display->setCursor(textX, textY);
-            display->print("Scan QR or connect");
-
-            textY += 10;
-            display->setCursor(textX, textY);
-            display->print("manually to configure");
+            display->print("Scan QR to connect");
 
         } while (display->nextPage());
 
@@ -2987,7 +2983,7 @@ void handleWebSocketMessage(const uint8_t* payload, size_t length) {
                     (!cfg.server.use_ssl && cfg.server.port != 80)) {
                     oauthUrl += ":" + String(cfg.server.port);
                 }
-                oauthUrl += "/oauth/authorize?device_id=" + cfg.device.id;
+                oauthUrl += "/slack/oauth/authorize?device_id=" + cfg.device.id;
                 oauthUrl += "&token=" + cfg.security.auth_token;
             }
 
