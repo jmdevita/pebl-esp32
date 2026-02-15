@@ -1166,6 +1166,99 @@ public:
     }
 
     /**
+     * Display trial expiry screen with QR code for purchasing an activation key.
+     * Shows a scannable QR code (left) encoding the full checkout URL with device_id,
+     * and text instructions (right) including "Trial Expired" header and device ID.
+     * Falls back to text-only display if URL is too long for QR or generation fails.
+     *
+     * @param purchaseUrl Full checkout URL with device_id query param
+     * @param deviceId The device ID to display for identification
+     */
+    static void showPurchaseQRCode(const String& purchaseUrl, const String& deviceId) {
+        logMessage(LOG_INFO, "DISPLAY", "Showing purchase QR code for trial expiry");
+
+        if (!display) return;
+
+        // Determine QR version based on URL length (byte encoding for URLs with :/?=)
+        // Version 5: up to 106 bytes, Version 6: up to 134 bytes (max for display)
+        // Typical URL: "https://getpebl.net/checkout?device_id=a1b2c3d4e5f6" (~55 chars)
+        uint8_t qrVersion;
+        size_t urlLen = purchaseUrl.length();
+        if (urlLen <= 106) {
+            qrVersion = 5;
+        } else if (urlLen <= 134) {
+            qrVersion = 6;
+        } else {
+            // URL too long for QR — fall back to text-only display
+            logMessage(LOG_WARN, "DISPLAY", "Purchase URL too long for QR code");
+            showMessage("Trial Expired", "Purchase key at:", purchaseUrl, String("ID: ") + deviceId);
+            return;
+        }
+
+        QRCode qrcode;
+        uint8_t qrcodeData[qrcode_getBufferSize(qrVersion)];
+        int8_t qrResult = qrcode_initText(&qrcode, qrcodeData, qrVersion, ECC_LOW, purchaseUrl.c_str());
+
+        if (qrResult != 0) {
+            logMessage(LOG_ERROR, "DISPLAY", "Purchase QR code generation failed");
+            showMessage("Trial Expired", "Purchase key at:", purchaseUrl, String("ID: ") + deviceId);
+            return;
+        }
+
+        display->setFullWindow();
+        display->firstPage();
+        do {
+            display->fillScreen(GxEPD_WHITE);
+            display->setTextColor(GxEPD_BLACK);
+
+            drawBatteryIndicator();
+            drawPowerStatusIndicator();
+
+            // Title at top
+            display->setFont(&FreeSansBold9pt7b);
+            display->setCursor(10, 14);
+            display->print("Trial Expired");
+
+            // QR code on the left, below title
+            const uint8_t scale = 2;
+            const int16_t qrX = 5;
+            const int16_t qrY = 18;
+
+            for (uint8_t y = 0; y < qrcode.size; y++) {
+                for (uint8_t x = 0; x < qrcode.size; x++) {
+                    uint16_t color = qrcode_getModule(&qrcode, x, y) ? GxEPD_BLACK : GxEPD_WHITE;
+                    display->fillRect(qrX + (x * scale), qrY + (y * scale), scale, scale, color);
+                }
+            }
+
+            // Instructions on the right side of QR code
+            display->setFont(nullptr);  // Small default font
+            const int16_t textX = qrX + (qrcode.size * scale) + 5;
+            int16_t textY = qrY + 2;
+
+            display->setCursor(textX, textY);
+            display->print("Scan to purchase");
+
+            textY += 10;
+            display->setCursor(textX, textY);
+            display->print("activation key");
+
+            textY += 14;
+            display->setCursor(textX, textY);
+            display->print("ID:");
+
+            textY += 10;
+            display->setCursor(textX, textY);
+            display->print(deviceId.substring(0, 8).c_str());
+
+        } while (display->nextPage());
+
+        updateDisplayStateAfterFullRefresh();
+
+        logMessage(LOG_INFO, "DISPLAY", "Purchase QR code displayed");
+    }
+
+    /**
      * Display self-service pairing code on e-paper.
      * Shows a human-readable 8-character code (e.g., "ABCD-1234") that the user
      * enters in Slack to link their account to this device. Used when auth_token
@@ -2918,19 +3011,20 @@ void handleWebSocketMessage(const uint8_t* payload, size_t length) {
 
             // Extract purchase URL from server response (fallback to hardcoded default)
             const char* purchaseUrl = doc["purchase_url"] | "";
-            String purchaseDisplay;
-            if (purchaseUrl[0] != '\0') {
-                purchaseDisplay = String(purchaseUrl);
-            } else {
-                purchaseDisplay = "See purchase info";
-            }
+            String id = deviceId[0] ? String(deviceId) : cfg.device.id;
 
-            // Display 4-line trial expiry message with purchase URL and device ID
-            String line1 = "Trial Expired";
-            String line2 = "Purchase key at:";
-            String line3 = purchaseDisplay;
-            String line4 = String("ID: ") + (deviceId[0] ? deviceId : cfg.device.id.c_str());
-            DisplayManager::showMessage(line1, line2, line3, line4);
+            if (purchaseUrl[0] != '\0') {
+                // Append device_id as query param so checkout auto-links to this device
+                // e.g., "https://getpebl.net/checkout?device_id=a1b2c3d4e5f6"
+                String fullUrl = String(purchaseUrl);
+                fullUrl += (fullUrl.indexOf('?') >= 0) ? "&" : "?";
+                fullUrl += "device_id=" + id;
+
+                // Show QR code for easy scanning (falls back to text if URL too long)
+                DisplayManager::showPurchaseQRCode(fullUrl, id);
+            } else {
+                DisplayManager::showMessage("Trial Expired", "Purchase key at:", "See purchase info", String("ID: ") + id);
+            }
 
             // Trial expiry is not transient — user must purchase a key before device works again
             registrationFailedPermanently = true;
@@ -2938,7 +3032,7 @@ void handleWebSocketMessage(const uint8_t* payload, size_t length) {
             webSocket.disconnect();
 
             logMessage(LOG_INFO, "WS", "Trial expired - entering 60-minute deep sleep",
-                       (String("purchase_url=") + purchaseDisplay).c_str());
+                       (String("device_id=") + id).c_str());
 
             // Deep sleep for 60 minutes (longer than 10-min error sleep since trial expiry isn't transient)
             // On wake: counter resets, device retries. If user purchased key, connection succeeds.
