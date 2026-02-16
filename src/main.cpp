@@ -1177,7 +1177,7 @@ public:
 
         // Determine QR version based on URL length (byte encoding for URLs with :/?=)
         // Version 5: up to 106 bytes, Version 6: up to 134 bytes (max for display)
-        // Typical URL: "https://getpebl.net/checkout?device_id=a1b2c3d4e5f6" (~55 chars)
+        // Typical URL: "https://pebl.ink/checkout?device_id=a1b2c3d4e5f6" (~54 chars)
         uint8_t qrVersion;
         size_t urlLen = purchaseUrl.length();
         if (urlLen <= 106) {
@@ -3012,7 +3012,7 @@ void handleWebSocketMessage(const uint8_t* payload, size_t length) {
 
             if (purchaseUrl[0] != '\0') {
                 // Append device_id as query param so checkout auto-links to this device
-                // e.g., "https://getpebl.net/checkout?device_id=a1b2c3d4e5f6"
+                // e.g., "https://pebl.ink/checkout?device_id=a1b2c3d4e5f6"
                 String fullUrl = String(purchaseUrl);
                 fullUrl += (fullUrl.indexOf('?') >= 0) ? "&" : "?";
                 fullUrl += "device_id=" + id;
