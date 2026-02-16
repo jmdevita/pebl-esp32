@@ -2813,11 +2813,12 @@ void webSocketEvent(WStype_t type, uint8_t* payload, size_t length) {
                 lastOTACheckMillis = millis();
             }
 
-            // Only show "Connected!" message if NOT waking from sleep (preserve reaction display)
-            if (!justWokeFromSleep) {
+            // Show "Connected!" only on first-ever connection (no reaction received yet)
+            // After receiving a reaction, preserve the display on reconnects and wake-from-sleep
+            if (!justWokeFromSleep && !lastReaction.hasReaction) {
                 DisplayManager::showMessage("", "Connected!", "Waiting for Reactions..", "", SecurityManager::isEnabled());
             } else {
-                logMessage(LOG_INFO, "WS", "Connected after wake - preserving display");
+                logMessage(LOG_INFO, "WS", "Connected - preserving display");
                 justWokeFromSleep = false;  // Clear flag after first connection
             }
             break;
