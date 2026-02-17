@@ -260,6 +260,7 @@ RTC_DATA_ATTR struct {
 } lastReaction;
 
 // Track what the display is showing (survives deep sleep)
+RTC_DATA_ATTR bool displayShowingConnectionLost = false;
 RTC_DATA_ATTR bool displayShowingBattery = false;
 RTC_DATA_ATTR bool hasShownBlankScreen = false;  // Track if we've shown blank screen at least once
 RTC_DATA_ATTR bool hasShownLowBatteryWarning = false;  // Track if low battery warning was shown (resets on USB)
@@ -862,6 +863,7 @@ public:
         logMessage(LOG_INFO, "DISPLAY", "Showing reaction", logBuf);
 
         // Save reaction data to RTC memory for redraw after deep sleep
+        displayShowingConnectionLost = false;
         lastReaction.hasReaction = true;
         strncpy(lastReaction.emoji, emoji, sizeof(lastReaction.emoji) - 1);
         lastReaction.emoji[sizeof(lastReaction.emoji) - 1] = '\0';
@@ -2764,6 +2766,7 @@ void webSocketEvent(WStype_t type, uint8_t* payload, size_t length) {
             // This prevents repeated e-paper refreshes that drain battery and are visually disruptive
             // After the initial warning, preserve the "Connection Lost" display until reconnected
             if (!enteringSleep && metrics.failedConnections == 10) {
+                displayShowingConnectionLost = true;
                 DisplayManager::showMessage("Connection Lost", "Check WiFi/Server");
             }
             break;
@@ -2822,13 +2825,29 @@ void webSocketEvent(WStype_t type, uint8_t* payload, size_t length) {
                 lastOTACheckMillis = millis();
             }
 
-            // Show "Connected!" only on first-ever connection (no reaction received yet)
-            // After receiving a reaction, preserve the display on reconnects and wake-from-sleep
-            if (!justWokeFromSleep && !lastReaction.hasReaction) {
+            // Update display based on what was showing before reconnection
+            justWokeFromSleep = false;
+            if (displayShowingConnectionLost && lastReaction.hasReaction) {
+                // "Connection Lost" was displayed over the last reaction — re-render it
+                displayShowingConnectionLost = false;
+                logMessage(LOG_INFO, "WS", "Reconnected - restoring last reaction");
+
+                JsonDocument doc;
+                doc["emoji"] = lastReaction.emoji;
+                doc["emoji_url"] = lastReaction.emojiUrl;
+                doc["user"] = lastReaction.user;
+                doc["channel"] = lastReaction.channel;
+                doc["message"] = lastReaction.message;
+                doc["timestamp"] = "";
+                doc["encrypted"] = lastReaction.isEncrypted;
+                DisplayManager::showReaction(doc.as<JsonObject>());
+            } else if (!lastReaction.hasReaction) {
+                // First-ever connection (no reaction received yet)
+                displayShowingConnectionLost = false;
                 DisplayManager::showMessage("", "Connected!", "Waiting for Reactions..", "", SecurityManager::isEnabled());
             } else {
+                // Normal reconnect with reaction still on screen (no "Connection Lost" was shown)
                 logMessage(LOG_INFO, "WS", "Connected - preserving display");
-                justWokeFromSleep = false;  // Clear flag after first connection
             }
             break;
         }
