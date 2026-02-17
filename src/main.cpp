@@ -256,6 +256,7 @@ RTC_DATA_ATTR struct {
     char user[64] = "";
     char channel[64] = "";
     char message[128] = "";
+    char platform[16] = "";
     bool isEncrypted = false;
 } lastReaction;
 
@@ -854,7 +855,7 @@ public:
         const char* user = reaction["user"] | "Unknown";
         const char* channel = reaction["channel"] | "Unknown";
         const char* message = reaction["message"] | "";
-        const char* timestamp = reaction["timestamp"] | "";
+        const char* platform = reaction["platform"] | "";
         bool isEncrypted = reaction["encrypted"] | false;
 
         char logBuf[256];
@@ -875,6 +876,8 @@ public:
         lastReaction.channel[sizeof(lastReaction.channel) - 1] = '\0';
         strncpy(lastReaction.message, message, sizeof(lastReaction.message) - 1);
         lastReaction.message[sizeof(lastReaction.message) - 1] = '\0';
+        strncpy(lastReaction.platform, platform, sizeof(lastReaction.platform) - 1);
+        lastReaction.platform[sizeof(lastReaction.platform) - 1] = '\0';
         lastReaction.isEncrypted = isEncrypted;
         logMessage(LOG_INFO, "RTC", "Saved reaction to RTC memory for deep sleep recovery");
 
@@ -965,10 +968,15 @@ public:
             display->setCursor(channelX, 92);  // Positioned closer to message content
             display->print(truncatedChannel);
 
-            // Timestamp at bottom left with smaller font
-            display->setFont(nullptr);  // Default small font
-            display->setCursor(10, display->height() - 5);  // Dynamic bottom position
-            display->print(timestamp);
+            // Platform indicator at bottom left (e.g. "Slack", "Discord")
+            if (platform[0] != '\0') {
+                display->setFont(nullptr);  // Default small font
+                display->setCursor(10, display->height() - 14);
+                // Capitalize first letter for display
+                String platformStr = platform;
+                platformStr[0] = toupper(platformStr[0]);
+                display->print(platformStr);
+            }
 
         } while (display->nextPage());
 
@@ -2838,7 +2846,7 @@ void webSocketEvent(WStype_t type, uint8_t* payload, size_t length) {
                 doc["user"] = lastReaction.user;
                 doc["channel"] = lastReaction.channel;
                 doc["message"] = lastReaction.message;
-                doc["timestamp"] = "";
+                doc["platform"] = lastReaction.platform;
                 doc["encrypted"] = lastReaction.isEncrypted;
                 DisplayManager::showReaction(doc.as<JsonObject>());
             } else if (!lastReaction.hasReaction) {
@@ -4452,7 +4460,7 @@ void setup() {
                     doc["user"] = lastReaction.user;
                     doc["channel"] = lastReaction.channel;
                     doc["message"] = lastReaction.message;
-                    doc["timestamp"] = "";  // No timestamp on redraw
+                    doc["platform"] = lastReaction.platform;
                     doc["encrypted"] = lastReaction.isEncrypted;
 
                     DisplayManager::showReaction(doc.as<JsonObject>());
@@ -4787,7 +4795,7 @@ void loop() {
                         doc["user"] = lastReaction.user;
                         doc["channel"] = lastReaction.channel;
                         doc["message"] = lastReaction.message;
-                        doc["timestamp"] = "";
+                        doc["platform"] = lastReaction.platform;
                         doc["encrypted"] = lastReaction.isEncrypted;
                         DisplayManager::showReaction(doc.as<JsonObject>());
                     } else {
@@ -4839,7 +4847,7 @@ void loop() {
                         doc["user"] = lastReaction.user;
                         doc["channel"] = lastReaction.channel;
                         doc["message"] = lastReaction.message;
-                        doc["timestamp"] = "";
+                        doc["platform"] = lastReaction.platform;
                         doc["encrypted"] = lastReaction.isEncrypted;
                         DisplayManager::showReaction(doc.as<JsonObject>());
                     } else {
