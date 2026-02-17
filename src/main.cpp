@@ -324,6 +324,7 @@ void performOTAUpdate();
 bool isDeviceIdle();
 void enterDeepSleep(uint32_t sleep_minutes);
 void enterPairingMode();
+void handleButtonHold(bool needsInit);
 
 // ============================================================================
 // Display State Helper
@@ -1137,7 +1138,7 @@ public:
 
             textY += 10;
             display->setCursor(textX, textY);
-            display->print("to link Slack");
+            display->print("to connect");
 
             textY += 14;
             display->setCursor(textX, textY);
@@ -1151,7 +1152,11 @@ public:
 
             textY += 14;
             display->setCursor(textX, textY);
-            display->print("Waiting...");
+            display->print("Restarts in 3min");
+
+            textY += 10;
+            display->setCursor(textX, textY);
+            display->print("Btn to restart");
 
         } while (display->nextPage());
 
@@ -1481,7 +1486,11 @@ void initializeDisplayHardware() {
     #endif
 
     // Initialize display
-    bool fromDeepSleep = (esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_TIMER);
+    // Skip initial full-clear refresh when waking from any deep sleep source (timer or button).
+    // The initial refresh adds ~5s of blocking time, which inflates button hold duration
+    // measurement and causes the tiered button handler to misfire.
+    esp_sleep_wakeup_cause_t wakeup = esp_sleep_get_wakeup_cause();
+    bool fromDeepSleep = (wakeup == ESP_SLEEP_WAKEUP_TIMER || wakeup == ESP_SLEEP_WAKEUP_EXT0);
     display->init(115200, !fromDeepSleep, 2, false);
     display->setRotation(cfg.display.rotation);
 
@@ -4051,6 +4060,115 @@ private:
 };
 
 // ============================================================================
+// Button Hold Handler — shared by deep sleep wake and main loop
+// ============================================================================
+// Handles tiered button press on GPIO 39 (boot button):
+//   3-9 seconds:  Show "Add Platform" QR code for multi-platform linking
+//   10+ seconds:  Enter WiFi provisioning portal
+//
+// When needsInit=true (deep sleep wake), loads config and initializes display.
+// When needsInit=false (main loop), config and display are already set up.
+void handleButtonHold(bool needsInit) {
+    uint32_t pressStart = millis();
+    bool showedFeedback = false;
+
+    // Measure how long button is held (up to 17s max detection)
+    while (digitalRead(GPIO_NUM_39) == LOW && (millis() - pressStart) < 17000) {
+        // At 3s mark: show visual feedback so user knows what will happen on release
+        if (!showedFeedback && (millis() - pressStart) >= 3000) {
+            if (needsInit) {
+                ConfigManager::begin();
+                if (!ConfigManager::load()) {
+                    break;
+                }
+                initializeDisplayHardware();
+            }
+            showedFeedback = true;
+            DisplayManager::showMessage("Release: Add Platform", "Keep holding 15s: WiFi Setup");
+        }
+        delay(50);
+    }
+
+    uint32_t pressDuration = millis() - pressStart;
+
+    if (pressDuration >= 15000) {
+        // 15+ seconds = WiFi provisioning (existing behavior)
+        logMessage(LOG_INFO, "CONFIG", "Extra-long press detected - entering forced config mode");
+
+        if (needsInit && !showedFeedback) {
+            ConfigManager::begin();
+            if (!ConfigManager::load()) {
+                logMessage(LOG_ERROR, "CONFIG", "Failed to load config - restarting");
+                ESP.restart();
+                return;
+            }
+            initializeDisplayHardware();
+        }
+
+        // startProvisioning() calls ESP.restart(), so no return needed
+        SlackNetworkManager::startProvisioning(true);
+
+    } else if (pressDuration >= 3000) {
+        // 3-9 seconds = "Add platform" QR code
+        logMessage(LOG_INFO, "CONFIG", "Medium press detected - showing add-platform QR code");
+
+        if (needsInit && !showedFeedback) {
+            ConfigManager::begin();
+            if (!ConfigManager::load()) {
+                logMessage(LOG_ERROR, "CONFIG", "Failed to load config - restarting");
+                ESP.restart();
+                return;
+            }
+            initializeDisplayHardware();
+        }
+
+        const AppConfig& btnCfg = ConfigManager::getConfig();
+
+        if (btnCfg.security.auth_token.length() > 0) {
+            // Build connect URL with device credentials for multi-platform linking
+            String protocol = btnCfg.server.use_ssl ? "https://" : "http://";
+            String connectUrl = protocol + btnCfg.server.host;
+            if ((btnCfg.server.use_ssl && btnCfg.server.port != 443) ||
+                (!btnCfg.server.use_ssl && btnCfg.server.port != 80)) {
+                connectUrl += ":" + String(btnCfg.server.port);
+            }
+            connectUrl += "/connect?device_id=" + btnCfg.device.id;
+            connectUrl += "&token=" + btnCfg.security.auth_token;
+
+            DisplayManager::showOAuthQRCode(connectUrl);
+            logMessage(LOG_INFO, "CONFIG", "Add-platform QR code displayed");
+
+            // Wait 3 minutes for user to scan QR and complete OAuth, then restart.
+            // Restart re-establishes the WebSocket connection so the server streams
+            // reactions from all linked platforms (not just the original one).
+            // Button press during wait dismisses immediately and restarts.
+            logMessage(LOG_INFO, "CONFIG", "Waiting 3 minutes for platform linking (press button to dismiss)");
+            unsigned long qrStart = millis();
+            while ((millis() - qrStart) < 180000) {
+                if (digitalRead(GPIO_NUM_39) == LOW) {
+                    logMessage(LOG_INFO, "CONFIG", "Button pressed - dismissing QR code");
+                    while (digitalRead(GPIO_NUM_39) == LOW) { delay(50); }
+                    break;
+                }
+                delay(100);
+            }
+
+            if (!isUSBPowered()) {
+                esp_sleep_enable_ext0_wakeup(GPIO_NUM_39, 0);
+                esp_deep_sleep_start();
+            } else {
+                logMessage(LOG_INFO, "CONFIG", "Restarting to reconnect with all linked platforms");
+                ESP.restart();
+            }
+        } else {
+            logMessage(LOG_WARN, "CONFIG", "Cannot show add-platform QR - device not paired yet");
+            DisplayManager::showMessage("Not paired yet", "Complete initial setup first");
+            delay(5000);
+        }
+    }
+}
+
+// ============================================================================
 // Arduino Setup Function
 // ============================================================================
 void setup() {
@@ -4072,6 +4190,11 @@ void setup() {
     }
 
     metrics.startTime = millis();
+
+    // Configure boot button (GPIO 39) as input for hold detection
+    // GPIO 39 is input-only with no internal pull-up; LilyGo T5 has external pull-up
+    // This enables button polling in the main loop and during deep sleep wake
+    pinMode(GPIO_NUM_39, INPUT);
 
     Serial.println(F("\n\n========================================"));
 #ifdef APP_VERSION
@@ -4095,97 +4218,11 @@ void setup() {
             isWakeFromSleep = true;
             break;
         case ESP_SLEEP_WAKEUP_EXT0:
-            // Button woke us up - check hold duration for tiered actions:
-            //   3-9 seconds:  "Add platform" — show QR code for /connect
-            //   10+ seconds:  WiFi provisioning portal (existing behavior)
-            pinMode(GPIO_NUM_39, INPUT_PULLUP);
+            // Button woke us up - check hold duration for tiered actions
             delay(100);  // Debounce
 
             if (digitalRead(GPIO_NUM_39) == LOW) {  // Button still pressed
-                // Measure how long button is held (up to 12s max detection)
-                uint32_t pressStart = millis();
-                bool showedFeedback = false;
-
-                while (digitalRead(GPIO_NUM_39) == LOW && (millis() - pressStart) < 12000) {
-                    // At 3s mark: show visual feedback so user knows what will happen on release
-                    if (!showedFeedback && (millis() - pressStart) >= 3000) {
-                        // Load config + display for feedback screen
-                        ConfigManager::begin();
-                        if (ConfigManager::load()) {
-                            showedFeedback = true;
-                            initializeDisplayHardware();
-                            DisplayManager::showMessage("Release: Add Platform", "Keep holding: WiFi Setup");
-                        }
-                    }
-                    delay(50);
-                }
-
-                uint32_t pressDuration = millis() - pressStart;
-
-                if (pressDuration >= 10000) {
-                    // 10+ seconds = WiFi provisioning (existing behavior)
-                    logMessage(LOG_INFO, "CONFIG", "Extra-long press detected - entering forced config mode");
-
-                    // Load config if not already loaded by feedback screen
-                    if (!showedFeedback) {
-                        ConfigManager::begin();
-                        if (!ConfigManager::load()) {
-                            logMessage(LOG_ERROR, "CONFIG", "Failed to load config - restarting");
-                            ESP.restart();
-                            return;
-                        }
-                        initializeDisplayHardware();
-                    }
-
-                    // Enter provisioning with forced portal mode (will show QR code screen)
-                    // startProvisioning() calls ESP.restart() at end, so no return needed
-                    SlackNetworkManager::startProvisioning(true);  // true = force portal
-
-                } else if (pressDuration >= 3000) {
-                    // 3-9 seconds = "Add platform" QR code
-                    logMessage(LOG_INFO, "CONFIG", "Medium press detected - showing add-platform QR code");
-
-                    // Config and display already loaded by feedback screen (showedFeedback=true)
-                    if (!showedFeedback) {
-                        ConfigManager::begin();
-                        if (!ConfigManager::load()) {
-                            logMessage(LOG_ERROR, "CONFIG", "Failed to load config - restarting");
-                            ESP.restart();
-                            return;
-                        }
-                        initializeDisplayHardware();
-                    }
-
-                    const AppConfig& btnCfg = ConfigManager::getConfig();
-
-                    // Only show QR if device is already paired (has auth_token)
-                    if (btnCfg.security.auth_token.length() > 0) {
-                        // Build connect URL with device credentials for multi-platform linking
-                        String protocol = btnCfg.server.use_ssl ? "https://" : "http://";
-                        String connectUrl = protocol + btnCfg.server.host;
-                        if ((btnCfg.server.use_ssl && btnCfg.server.port != 443) ||
-                            (!btnCfg.server.use_ssl && btnCfg.server.port != 80)) {
-                            connectUrl += ":" + String(btnCfg.server.port);
-                        }
-                        connectUrl += "/connect?device_id=" + btnCfg.device.id;
-                        connectUrl += "&token=" + btnCfg.security.auth_token;
-
-                        DisplayManager::showOAuthQRCode(connectUrl);
-                        logMessage(LOG_INFO, "CONFIG", "Add-platform QR code displayed, sleeping in 2 minutes");
-
-                        // Stay awake for 2 minutes to let user scan, then deep sleep
-                        delay(120000);
-
-                        // Configure button wake source before sleeping
-                        // Without this, the device would require a power cycle to wake
-                        esp_sleep_enable_ext0_wakeup(GPIO_NUM_39, 0);  // Wake on button press (active LOW)
-                        esp_deep_sleep_start();
-                    } else {
-                        logMessage(LOG_WARN, "CONFIG", "Cannot show add-platform QR - device not paired yet");
-                        DisplayManager::showMessage("Not paired yet", "Complete initial setup first");
-                        delay(5000);
-                    }
-                }
+                handleButtonHold(true);  // needsInit=true: load config + display
             }
 
             // Short press = normal wake behavior
@@ -4630,6 +4667,20 @@ void loop() {
         }
     }
     #endif
+
+    // Button hold detection while awake (USB or between sleep cycles)
+    // GPIO 39 is LOW when pressed (external pull-up on LilyGo T5 board)
+    static bool buttonWasPressed = false;
+    if (digitalRead(GPIO_NUM_39) == LOW) {
+        if (!buttonWasPressed) {
+            buttonWasPressed = true;
+            // Button just pressed — run tiered hold handler
+            // This blocks until button is released (up to 12s), same as deep sleep wake path
+            handleButtonHold(false);  // needsInit=false: config and display already initialized
+        }
+    } else {
+        buttonWasPressed = false;
+    }
 
     // Power management - check battery status every 10 seconds
     using namespace BatteryConstants;

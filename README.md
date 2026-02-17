@@ -109,10 +109,10 @@ The BOOT button (GPIO 39) supports three actions based on hold duration:
 | Hold | Action | Details |
 |------|--------|---------|
 | Short press | Wake | Wakes device from deep sleep |
-| 3–9 seconds | Add platform | Shows QR code to link an additional platform (e.g., add Discord to a Slack-linked device) |
-| 10+ seconds | WiFi setup | Launches captive portal for WiFi provisioning |
+| 3–14 seconds | Add platform | Shows QR code to link an additional platform (e.g., add Discord to a Slack-linked device) |
+| 15+ seconds | WiFi setup | Launches captive portal for WiFi provisioning |
 
-At the 3-second mark, the display shows feedback so you know when to release. The "Add platform" QR code points to the `/connect` page with device credentials pre-filled. It stays on screen for 2 minutes, then the device sleeps.
+At the 3-second mark, the display shows feedback so you know when to release. The "Add platform" QR code points to the `/connect` page with device credentials pre-filled. After 3 minutes the device restarts automatically to connect with all linked platforms. Press the button to restart immediately.
 
 The "Add platform" option only appears if the device is already paired (has an auth token). On an unpaired device, only WiFi provisioning is available.
 
