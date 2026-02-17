@@ -102,6 +102,20 @@ With `skip_refresh_on_no_message` enabled, the display only refreshes when new r
 
 `0` = portrait, `1` = landscape (default), `2` = portrait inverted, `3` = landscape inverted
 
+## Boot Button
+
+The BOOT button (GPIO 39) supports three actions based on hold duration:
+
+| Hold | Action | Details |
+|------|--------|---------|
+| Short press | Wake | Wakes device from deep sleep |
+| 3–9 seconds | Add platform | Shows QR code to link an additional platform (e.g., add Discord to a Slack-linked device) |
+| 10+ seconds | WiFi setup | Launches captive portal for WiFi provisioning |
+
+At the 3-second mark, the display shows feedback so you know when to release. The "Add platform" QR code points to the `/connect` page with device credentials pre-filled. It stays on screen for 2 minutes, then the device sleeps.
+
+The "Add platform" option only appears if the device is already paired (has an auth token). On an unpaired device, only WiFi provisioning is available.
+
 ## Project Structure
 
 ```

@@ -2973,18 +2973,17 @@ void handleWebSocketMessage(const uint8_t* payload, size_t length) {
             // Extract OAuth URL from server response (if provided)
             const char* serverOAuthUrl = doc["oauth_url"] | "";
 
-            if (serverOAuthUrl[0] != '\0') {
-                // Use the URL provided by server
-                oauthUrl = String(serverOAuthUrl);
-            } else {
-                // Fallback: build URL from config if server didn't provide one
+            // Always build URL client-side pointing to /connect (platform-agnostic)
+            // Only the device has the plaintext auth_token — server stores it hashed.
+            // Ignore server-provided URL since it can't include the token.
+            {
                 String protocol = cfg.server.use_ssl ? "https://" : "http://";
                 oauthUrl = protocol + cfg.server.host;
                 if ((cfg.server.use_ssl && cfg.server.port != 443) ||
                     (!cfg.server.use_ssl && cfg.server.port != 80)) {
                     oauthUrl += ":" + String(cfg.server.port);
                 }
-                oauthUrl += "/slack/oauth/authorize?device_id=" + cfg.device.id;
+                oauthUrl += "/connect?device_id=" + cfg.device.id;
                 oauthUrl += "&token=" + cfg.security.auth_token;
             }
 
@@ -4096,35 +4095,96 @@ void setup() {
             isWakeFromSleep = true;
             break;
         case ESP_SLEEP_WAKEUP_EXT0:
-            // Button woke us up - check for long press to enter config mode
+            // Button woke us up - check hold duration for tiered actions:
+            //   3-9 seconds:  "Add platform" — show QR code for /connect
+            //   10+ seconds:  WiFi provisioning portal (existing behavior)
             pinMode(GPIO_NUM_39, INPUT_PULLUP);
             delay(100);  // Debounce
 
             if (digitalRead(GPIO_NUM_39) == LOW) {  // Button still pressed
-                // Measure how long button is held
+                // Measure how long button is held (up to 12s max detection)
                 uint32_t pressStart = millis();
-                while (digitalRead(GPIO_NUM_39) == LOW && (millis() - pressStart) < 5000) {
+                bool showedFeedback = false;
+
+                while (digitalRead(GPIO_NUM_39) == LOW && (millis() - pressStart) < 12000) {
+                    // At 3s mark: show visual feedback so user knows what will happen on release
+                    if (!showedFeedback && (millis() - pressStart) >= 3000) {
+                        // Load config + display for feedback screen
+                        ConfigManager::begin();
+                        if (ConfigManager::load()) {
+                            showedFeedback = true;
+                            initializeDisplayHardware();
+                            DisplayManager::showMessage("Release: Add Platform", "Keep holding: WiFi Setup");
+                        }
+                    }
                     delay(50);
                 }
 
                 uint32_t pressDuration = millis() - pressStart;
-                if (pressDuration >= 3000) {  // Held for 3+ seconds = config mode
-                    logMessage(LOG_INFO, "CONFIG", "Long press detected - entering forced config mode");
 
-                    // Load config for startProvisioning to access
-                    ConfigManager::begin();
-                    if (!ConfigManager::load()) {
-                        logMessage(LOG_ERROR, "CONFIG", "Failed to load config - restarting");
-                        ESP.restart();
-                        return;  // Never reached, but explicit
+                if (pressDuration >= 10000) {
+                    // 10+ seconds = WiFi provisioning (existing behavior)
+                    logMessage(LOG_INFO, "CONFIG", "Extra-long press detected - entering forced config mode");
+
+                    // Load config if not already loaded by feedback screen
+                    if (!showedFeedback) {
+                        ConfigManager::begin();
+                        if (!ConfigManager::load()) {
+                            logMessage(LOG_ERROR, "CONFIG", "Failed to load config - restarting");
+                            ESP.restart();
+                            return;
+                        }
+                        initializeDisplayHardware();
                     }
-
-                    // Initialize display hardware (required for QR code provisioning screen)
-                    initializeDisplayHardware();
 
                     // Enter provisioning with forced portal mode (will show QR code screen)
                     // startProvisioning() calls ESP.restart() at end, so no return needed
                     SlackNetworkManager::startProvisioning(true);  // true = force portal
+
+                } else if (pressDuration >= 3000) {
+                    // 3-9 seconds = "Add platform" QR code
+                    logMessage(LOG_INFO, "CONFIG", "Medium press detected - showing add-platform QR code");
+
+                    // Config and display already loaded by feedback screen (showedFeedback=true)
+                    if (!showedFeedback) {
+                        ConfigManager::begin();
+                        if (!ConfigManager::load()) {
+                            logMessage(LOG_ERROR, "CONFIG", "Failed to load config - restarting");
+                            ESP.restart();
+                            return;
+                        }
+                        initializeDisplayHardware();
+                    }
+
+                    const AppConfig& btnCfg = ConfigManager::getConfig();
+
+                    // Only show QR if device is already paired (has auth_token)
+                    if (btnCfg.security.auth_token.length() > 0) {
+                        // Build connect URL with device credentials for multi-platform linking
+                        String protocol = btnCfg.server.use_ssl ? "https://" : "http://";
+                        String connectUrl = protocol + btnCfg.server.host;
+                        if ((btnCfg.server.use_ssl && btnCfg.server.port != 443) ||
+                            (!btnCfg.server.use_ssl && btnCfg.server.port != 80)) {
+                            connectUrl += ":" + String(btnCfg.server.port);
+                        }
+                        connectUrl += "/connect?device_id=" + btnCfg.device.id;
+                        connectUrl += "&token=" + btnCfg.security.auth_token;
+
+                        DisplayManager::showOAuthQRCode(connectUrl);
+                        logMessage(LOG_INFO, "CONFIG", "Add-platform QR code displayed, sleeping in 2 minutes");
+
+                        // Stay awake for 2 minutes to let user scan, then deep sleep
+                        delay(120000);
+
+                        // Configure button wake source before sleeping
+                        // Without this, the device would require a power cycle to wake
+                        esp_sleep_enable_ext0_wakeup(GPIO_NUM_39, 0);  // Wake on button press (active LOW)
+                        esp_deep_sleep_start();
+                    } else {
+                        logMessage(LOG_WARN, "CONFIG", "Cannot show add-platform QR - device not paired yet");
+                        DisplayManager::showMessage("Not paired yet", "Complete initial setup first");
+                        delay(5000);
+                    }
                 }
             }
 
