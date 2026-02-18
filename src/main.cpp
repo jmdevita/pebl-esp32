@@ -24,6 +24,7 @@
 #include <Fonts/FreeSans9pt7b.h>
 #include <Fonts/FreeSans12pt7b.h>
 #include <Fonts/FreeSansBold9pt7b.h>
+#include <Fonts/FreeSansBold18pt7b.h>
 #include <Fonts/FreeSansOblique9pt7b.h>
 #include "config/ConfigManager.h"
 #include "wifi/WiFiCredentialManager.h"
@@ -845,6 +846,229 @@ public:
         } while (display->nextPage());
 
         // Update display state flags after full refresh
+        updateDisplayStateAfterFullRefresh();
+    }
+
+    // Branded splash screen: left half black, right half white, "pebl" wordmark centered
+    // spanning both halves ("pe" in white on black, "bl" in black on white)
+    static void showSplashScreen(const String& version) {
+        logMessage(LOG_INFO, "DISPLAY", "Showing splash screen");
+
+        if (!display) return;
+
+        display->setFullWindow();
+        display->firstPage();
+        do {
+            display->fillScreen(GxEPD_WHITE);
+
+            // Fill left half black
+            int16_t halfWidth = display->width() / 2;
+            display->fillRect(0, 0, halfWidth, display->height(), GxEPD_BLACK);
+
+            // Measure full "pebl" text to center it
+            display->setFont(&FreeSansBold18pt7b);
+            display->setTextColor(GxEPD_BLACK);
+            int16_t tbx, tby;
+            uint16_t tbw, tbh;
+            display->getTextBounds("pebl", 0, 0, &tbx, &tby, &tbw, &tbh);
+
+            // Center the full word on the display
+            int16_t x = (display->width() - tbw) / 2 - tbx;
+            int16_t y = (display->height() - tbh) / 2 - tby;
+
+            // Render "pe" in white (on the black half)
+            display->setTextColor(GxEPD_WHITE);
+            display->setCursor(x, y);
+            display->print("pe");
+
+            // Measure "pe" width to position "bl"
+            uint16_t peW, peH;
+            int16_t pex, pey;
+            display->getTextBounds("pe", 0, 0, &pex, &pey, &peW, &peH);
+
+            // Render "bl" in black (on the white half)
+            display->setTextColor(GxEPD_BLACK);
+            display->setCursor(x + peW + pex - tbx, y);
+            display->print("bl");
+
+            // Version in small font, bottom-right corner
+            if (!version.isEmpty()) {
+                display->setFont(&FreeSans9pt7b);
+                int16_t vx, vy;
+                uint16_t vw, vh;
+                display->getTextBounds(version, 0, 0, &vx, &vy, &vw, &vh);
+                display->setCursor(display->width() - vw - 5, display->height() - 5);
+                display->print(version);
+            }
+        } while (display->nextPage());
+
+        updateDisplayStateAfterFullRefresh();
+    }
+
+    // Boot status screen: "Connecting..." centered with device name below, battery top-right
+    static void showBootStatus(const String& deviceName) {
+        logMessage(LOG_INFO, "DISPLAY", "Showing boot status screen");
+
+        if (!display) return;
+
+        display->setFullWindow();
+        display->firstPage();
+        do {
+            display->fillScreen(GxEPD_WHITE);
+            display->setTextColor(GxEPD_BLACK);
+
+            // Battery indicator top-right
+            drawBatteryIndicator();
+
+            // "Connecting..." centered
+            display->setFont(&FreeSans9pt7b);
+            int16_t tx, ty;
+            uint16_t tw, th;
+            display->getTextBounds("Connecting to Server...", 0, 0, &tx, &ty, &tw, &th);
+            int16_t cx = (display->width() - tw) / 2;
+            int16_t cy = (display->height() - th) / 2 - ty;
+            display->setCursor(cx, cy);
+            display->print("Connecting to Server...");
+
+            // Device name below
+            if (!deviceName.isEmpty()) {
+                int16_t nx, ny;
+                uint16_t nw, nh;
+                display->getTextBounds(deviceName, 0, 0, &nx, &ny, &nw, &nh);
+                display->setCursor((display->width() - nw) / 2, cy + th + 8);
+                display->print(deviceName);
+            }
+        } while (display->nextPage());
+
+        updateDisplayStateAfterFullRefresh();
+    }
+
+    // Connected screen: checkmark icon, "Connected!" in bold, subtitle centered below
+    static void showConnectedScreen(bool showLockIcon = false) {
+        logMessage(LOG_INFO, "DISPLAY", "Showing connected screen");
+
+        if (!display) return;
+
+        display->setFullWindow();
+        display->firstPage();
+        do {
+            display->fillScreen(GxEPD_WHITE);
+            display->setTextColor(GxEPD_BLACK);
+
+            // Battery indicator top-right
+            drawBatteryIndicator();
+
+            // Lock icon if encryption enabled
+            if (showLockIcon) {
+                drawLockIcon();
+            }
+
+            // Layout: checkmark, "Connected!", subtitle — all centered vertically as a group
+            // Measure text to calculate total group height
+            display->setFont(&FreeSansBold9pt7b);
+            int16_t c1x, c1y;
+            uint16_t c1w, c1h;
+            display->getTextBounds("Connected!", 0, 0, &c1x, &c1y, &c1w, &c1h);
+
+            display->setFont(&FreeSans9pt7b);
+            int16_t c2x, c2y;
+            uint16_t c2w, c2h;
+            display->getTextBounds("Waiting for Reactions..", 0, 0, &c2x, &c2y, &c2w, &c2h);
+
+            int16_t checkSize = 20;   // Checkmark bounding box
+            int16_t gap1 = 10;        // Space between checkmark and "Connected!"
+            int16_t gap2 = 6;         // Space between "Connected!" and subtitle
+            int16_t totalHeight = checkSize + gap1 + c1h + gap2 + c2h;
+            int16_t startY = (display->height() - totalHeight) / 2;
+            int16_t centerX = display->width() / 2;
+
+            // Draw checkmark: a simple "V" shape drawn with thick lines
+            int16_t checkCenterX = centerX;
+            int16_t checkTopY = startY;
+            // Checkmark points: left, bottom-center, top-right
+            int16_t lx = checkCenterX - 10;
+            int16_t ly = checkTopY + 10;
+            int16_t mx = checkCenterX - 3;
+            int16_t my = checkTopY + 18;
+            int16_t rx = checkCenterX + 10;
+            int16_t ry = checkTopY + 2;
+            // Draw with thickness by offsetting
+            for (int t = 0; t < 3; t++) {
+                display->drawLine(lx, ly + t, mx, my + t, GxEPD_BLACK);
+                display->drawLine(mx, my + t, rx, ry + t, GxEPD_BLACK);
+            }
+
+            // "Connected!" in bold, centered
+            int16_t textY = startY + checkSize + gap1;
+            display->setFont(&FreeSansBold9pt7b);
+            display->setCursor(centerX - c1w / 2, textY + c1h);
+            display->print("Connected!");
+
+            // "Waiting for Reactions.." in regular, centered below
+            int16_t subY = textY + c1h + gap2;
+            display->setFont(&FreeSans9pt7b);
+            display->setCursor(centerX - c2w / 2, subY + c2h);
+            display->print("Waiting for Reactions..");
+        } while (display->nextPage());
+
+        updateDisplayStateAfterFullRefresh();
+    }
+
+    // Disconnected screen: X icon, "Connection Lost" in bold, subtitle centered below
+    static void showDisconnectedScreen(const String& subtitle = "Check WiFi/Server") {
+        logMessage(LOG_INFO, "DISPLAY", "Showing disconnected screen");
+
+        if (!display) return;
+
+        display->setFullWindow();
+        display->firstPage();
+        do {
+            display->fillScreen(GxEPD_WHITE);
+            display->setTextColor(GxEPD_BLACK);
+
+            // Battery indicator top-right
+            drawBatteryIndicator();
+
+            // Measure text to calculate total group height
+            display->setFont(&FreeSansBold9pt7b);
+            int16_t c1x, c1y;
+            uint16_t c1w, c1h;
+            display->getTextBounds("Connection Lost", 0, 0, &c1x, &c1y, &c1w, &c1h);
+
+            display->setFont(&FreeSans9pt7b);
+            int16_t c2x, c2y;
+            uint16_t c2w, c2h;
+            display->getTextBounds(subtitle, 0, 0, &c2x, &c2y, &c2w, &c2h);
+
+            int16_t iconSize = 20;
+            int16_t gap1 = 10;
+            int16_t gap2 = 6;
+            int16_t totalHeight = iconSize + gap1 + c1h + gap2 + c2h;
+            int16_t startY = (display->height() - totalHeight) / 2;
+            int16_t centerX = display->width() / 2;
+
+            // Draw X icon with thick lines
+            int16_t ix = centerX - 8;
+            int16_t iy = startY + 2;
+            int16_t iSize = 16;
+            for (int t = 0; t < 3; t++) {
+                display->drawLine(ix, iy + t, ix + iSize, iy + iSize + t, GxEPD_BLACK);
+                display->drawLine(ix + iSize, iy + t, ix, iy + iSize + t, GxEPD_BLACK);
+            }
+
+            // "Connection Lost" in bold, centered
+            int16_t textY = startY + iconSize + gap1;
+            display->setFont(&FreeSansBold9pt7b);
+            display->setCursor(centerX - c1w / 2, textY + c1h);
+            display->print("Connection Lost");
+
+            // Subtitle in regular, centered below
+            int16_t subY = textY + c1h + gap2;
+            display->setFont(&FreeSans9pt7b);
+            display->setCursor(centerX - c2w / 2, subY + c2h);
+            display->print(subtitle);
+        } while (display->nextPage());
+
         updateDisplayStateAfterFullRefresh();
     }
 
@@ -2497,12 +2721,7 @@ void enterPairingMode() {
                 logMessage(LOG_WARN, "PAIRING", "Poll network error", logBuf);
                 if (networkErrors >= MAX_NETWORK_ERRORS) {
                     logMessage(LOG_ERROR, "PAIRING", "Too many network errors during polling");
-                    DisplayManager::showMessage(
-                        "Connection Lost",
-                        "Network errors",
-                        "Retrying later...",
-                        ""
-                    );
+                    DisplayManager::showDisconnectedScreen("Network error, retrying later...");
                     delay(3000);
                     enterDeepSleep(5);
                     return;
@@ -2775,7 +2994,7 @@ void webSocketEvent(WStype_t type, uint8_t* payload, size_t length) {
             // After the initial warning, preserve the "Connection Lost" display until reconnected
             if (!enteringSleep && metrics.failedConnections == 10) {
                 displayShowingConnectionLost = true;
-                DisplayManager::showMessage("Connection Lost", "Check WiFi/Server");
+                DisplayManager::showDisconnectedScreen("Check WiFi/Server");
             }
             break;
         }
@@ -2852,7 +3071,7 @@ void webSocketEvent(WStype_t type, uint8_t* payload, size_t length) {
             } else if (!lastReaction.hasReaction) {
                 // First-ever connection (no reaction received yet)
                 displayShowingConnectionLost = false;
-                DisplayManager::showMessage("", "Connected!", "Waiting for Reactions..", "", SecurityManager::isEnabled());
+                DisplayManager::showConnectedScreen(SecurityManager::isEnabled());
             } else {
                 // Normal reconnect with reaction still on screen (no "Connection Lost" was shown)
                 logMessage(LOG_INFO, "WS", "Connected - preserving display");
@@ -4225,9 +4444,9 @@ void setup() {
 
     Serial.println(F("\n\n========================================"));
 #ifdef APP_VERSION
-    Serial.println(F("ESP32 Slack Reactions Client v" APP_VERSION));
+    Serial.println(F("pebl v" APP_VERSION));
 #else
-    Serial.println(F("ESP32 Slack Reactions Client"));
+    Serial.println(F("pebl"));
 #endif
     Serial.println(F("========================================"));
 
@@ -4295,13 +4514,14 @@ void setup() {
     // Initialize display hardware (SPI + display driver)
     initializeDisplayHardware();
 
-    // Show boot screen only on power-on, not on wake from deep sleep
+    // Show branded splash screen only on power-on, not on wake from deep sleep
     if (!isWakeFromSleep) {
 #ifdef APP_VERSION
-        DisplayManager::showMessage("Slack Reactions", "Starting...", cfg.device.name, "v" APP_VERSION);
+        DisplayManager::showSplashScreen("v" APP_VERSION);
 #else
-        DisplayManager::showMessage("Slack Reactions", "Starting...", cfg.device.name, "");
+        DisplayManager::showSplashScreen("");
 #endif
+        delay(3000);  // Hold splash screen for 3 seconds
     } else {
         // On wake from sleep, preserve display state (e-paper retains image without power)
         logMessage(LOG_INFO, "DISPLAY", "Preserving display state on wake from sleep");
@@ -4379,6 +4599,11 @@ void setup() {
                 logMessage(LOG_INFO, "POWER", "Sleep disabled - continuing with WiFi connection despite low battery");
             }
         }
+    }
+
+    // Show boot status screen before WiFi connection (fresh boot only)
+    if (!isWakeFromSleep) {
+        DisplayManager::showBootStatus(cfg.device.name);
     }
 
     // Small delay before WiFi connection to let radio stabilize
