@@ -222,14 +222,10 @@ namespace {  // Anonymous namespace for internal linkage
     const uint8_t MAX_REGISTRATION_RETRIES = 3;
     bool registrationFailedPermanently = false;  // Stop reconnecting after max retries
 
-    // OAuth QR code state for device linking flow
-    // When device is not linked to a user, we display a QR code that the user can scan
-    // to complete OAuth and link their Slack account to this device
-    bool showingOAuthQR = false;              // Currently displaying QR code for linking
-    String oauthUrl = "";                     // OAuth URL to encode in QR code
-    unsigned long qrDisplayStartTime = 0;    // When QR code was first displayed
-    const unsigned long QR_RECONNECT_INTERVAL_MS = 60000;   // Check if linked every 60 seconds
-    const unsigned long QR_DISPLAY_TIMEOUT_MS = 600000;     // Give up after 10 minutes
+    // DEVICE_NOT_LINKED retry tracking — prevents infinite pairing loop on battery.
+    // After MAX attempts, show help screen and deep sleep to let user intervene manually.
+    uint8_t deviceNotLinkedCount = 0;
+    const uint8_t MAX_DEVICE_NOT_LINKED_ATTEMPTS = 2;
 
     // Connection metrics
     struct ConnectionMetrics {
@@ -1282,122 +1278,6 @@ public:
         updateDisplayStateAfterFullRefresh();
 
         logMessage(LOG_INFO, "DISPLAY", "Provisioning mode displayed");
-    }
-
-    /**
-     * Display OAuth QR code for device linking.
-     * Shows a QR code that users scan with their phone to complete Slack OAuth
-     * and link their account to this device. Used when device credentials exist
-     * but no user is associated with the device yet.
-     *
-     * @param url The OAuth URL to encode in the QR code (includes device_id and token)
-     */
-    static void showOAuthQRCode(const String& url) {
-        logMessage(LOG_INFO, "DISPLAY", "Showing OAuth QR code for device linking");
-
-        if (!display) return;
-
-        // Determine QR code version based on URL length
-        // OAuth URLs use byte encoding (not alphanumeric) due to special chars like :, /, ?, =
-        // Byte mode capacity at ECC_LOW:
-        //   Version 5 (37x37): 106 bytes max
-        //   Version 6 (41x41): 134 bytes max
-        //
-        // Display constraint: 212x104 pixels, QR starts at Y=22, scale=2
-        // Max QR height at scale 2: (104-22)/2 = 41 modules = Version 6 max
-        // For URLs > 134 bytes, we must show an error (URL too long for display)
-        uint8_t qrVersion;
-        size_t urlLen = url.length();
-        if (urlLen <= 106) {
-            qrVersion = 5;      // 37x37 modules = 74px at scale 2
-        } else if (urlLen <= 134) {
-            qrVersion = 6;      // 41x41 modules = 82px at scale 2 (max for display)
-        } else {
-            // URL too long for QR code that fits on display
-            logMessage(LOG_ERROR, "DISPLAY", "OAuth URL too long for display");
-            char logBuf[64];
-            snprintf(logBuf, sizeof(logBuf), "url_len=%zu max=134", urlLen);
-            logMessage(LOG_ERROR, "DISPLAY", "URL length exceeds display capacity", logBuf);
-            showMessage("Link Device", "URL too long", "Contact admin", "to shorten URL");
-            return;
-        }
-
-        QRCode qrcode;
-        uint8_t qrcodeData[qrcode_getBufferSize(qrVersion)];
-        int8_t qrResult = qrcode_initText(&qrcode, qrcodeData, qrVersion, ECC_LOW, url.c_str());
-
-        if (qrResult != 0) {
-            logMessage(LOG_ERROR, "DISPLAY", "QR code generation failed");
-            showMessage("Link Device", "QR generation failed", "URL too long", "Contact support");
-            return;
-        }
-
-        display->setFullWindow();
-        display->firstPage();
-        do {
-            display->fillScreen(GxEPD_WHITE);
-            display->setTextColor(GxEPD_BLACK);
-
-            // Draw battery and power indicators
-            drawBatteryIndicator();
-            drawPowerStatusIndicator();
-
-            // Title - positioned at top, baseline at Y=14 (text renders above baseline)
-            display->setFont(&FreeSansBold9pt7b);
-            display->setCursor(10, 14);
-            display->print("Link Device");
-
-            // QR Code - positioned on the left side below title
-            // Scale factor: 2 pixels per module for reliable phone scanning
-            // Y position 18 allows Version 6 (41*2=82px) to fit: 18+82=100 < 104 (display height)
-            const uint8_t scale = 2;
-            const int16_t qrX = 5;
-            const int16_t qrY = 18;
-
-            // Draw each QR code module
-            for (uint8_t y = 0; y < qrcode.size; y++) {
-                for (uint8_t x = 0; x < qrcode.size; x++) {
-                    uint16_t color = qrcode_getModule(&qrcode, x, y) ? GxEPD_BLACK : GxEPD_WHITE;
-                    display->fillRect(qrX + (x * scale), qrY + (y * scale), scale, scale, color);
-                }
-            }
-
-            // Instructions on the right side of QR code
-            display->setFont(nullptr);  // Small default font
-            const int16_t textX = qrX + (qrcode.size * scale) + 5;
-            int16_t textY = qrY + 2;
-
-            display->setCursor(textX, textY);
-            display->print("Scan with phone");
-
-            textY += 10;
-            display->setCursor(textX, textY);
-            display->print("to connect");
-
-            textY += 14;
-            display->setCursor(textX, textY);
-            display->print("ID:");
-
-            textY += 10;
-            display->setCursor(textX, textY);
-            // Show first 8 characters of device ID for identification
-            String shortId = ConfigManager::getDeviceId().substring(0, 8);
-            display->print(shortId.c_str());
-
-            textY += 14;
-            display->setCursor(textX, textY);
-            display->print("Restarts in 3min");
-
-            textY += 10;
-            display->setCursor(textX, textY);
-            display->print("Btn to restart");
-
-        } while (display->nextPage());
-
-        // Update display state flags after full refresh
-        updateDisplayStateAfterFullRefresh();
-
-        logMessage(LOG_INFO, "DISPLAY", "OAuth QR code displayed");
     }
 
     /**
@@ -3010,14 +2890,6 @@ void webSocketEvent(WStype_t type, uint8_t* payload, size_t length) {
             registrationErrorCount = 0;  // Reset registration error tracking on successful connection
             registrationFailedPermanently = false;
 
-            // Clear OAuth QR state on successful connection - device linking completed
-            if (showingOAuthQR) {
-                logMessage(LOG_INFO, "WS", "Device linking successful - clearing QR mode");
-                showingOAuthQR = false;
-                oauthUrl = "";
-                qrDisplayStartTime = 0;
-            }
-
             ResilienceManager::markConnectionRestored();  // Track restoration
             ResilienceManager::recordHeartbeat();  // Record initial heartbeat
             const AppConfig& cfg = ConfigManager::getConfig();
@@ -3220,38 +3092,35 @@ void handleWebSocketMessage(const uint8_t* payload, size_t length) {
         snprintf(logBuf, sizeof(logBuf), "code=%s message=\"%s\"", errorCode, errorMsg);
         logMessage(LOG_ERROR, "WS", "Server error", logBuf);
 
-        // Handle DEVICE_NOT_LINKED with QR code display for user-friendly linking
-        // Server sends OAuth URL that user can scan to link their Slack account to this device
+        // Handle DEVICE_NOT_LINKED — device has credentials but no user is linked.
+        // Enter pairing mode so the user can link via the pairing modal.
+        // Tracks attempts to prevent infinite loop on battery: after MAX attempts,
+        // show a help screen and deep sleep so the user can manually intervene.
         if (strcmp(errorCode, "DEVICE_NOT_LINKED") == 0) {
-            const AppConfig& cfg = ConfigManager::getConfig();
+            deviceNotLinkedCount++;
 
-            // Extract OAuth URL from server response (if provided)
-            const char* serverOAuthUrl = doc["oauth_url"] | "";
-
-            // Always build URL client-side pointing to /connect (platform-agnostic)
-            // Only the device has the plaintext auth_token — server stores it hashed.
-            // Ignore server-provided URL since it can't include the token.
-            {
-                String protocol = cfg.server.use_ssl ? "https://" : "http://";
-                oauthUrl = protocol + cfg.server.host;
-                if ((cfg.server.use_ssl && cfg.server.port != 443) ||
-                    (!cfg.server.use_ssl && cfg.server.port != 80)) {
-                    oauthUrl += ":" + String(cfg.server.port);
-                }
-                oauthUrl += "/connect?device_id=" + cfg.device.id;
-                oauthUrl += "&token=" + cfg.security.auth_token;
+            if (deviceNotLinkedCount > MAX_DEVICE_NOT_LINKED_ATTEMPTS) {
+                logMessage(LOG_WARN, "WS", "Too many DEVICE_NOT_LINKED errors - sleeping");
+                DisplayManager::showMessage("Pairing needed", "Hold button 3-9 sec",
+                                          "to re-enter pairing", "");
+                delay(5000);
+                enterDeepSleep(15);  // 15-minute sleep; button press wakes immediately
+                return;
             }
 
-            // Display QR code for user to scan
-            DisplayManager::showOAuthQRCode(oauthUrl);
-
-            // Enter QR code mode - will poll periodically to check if linking completed
-            showingOAuthQR = true;
-            qrDisplayStartTime = millis();
+            logMessage(LOG_INFO, "WS", "Device not linked - entering pairing mode");
             wsConnected = false;
             webSocket.disconnect();
 
-            logMessage(LOG_INFO, "WS", "Entering OAuth QR mode - waiting for user to link device");
+            // enterPairingMode() blocks until pairing succeeds or fails.
+            // On success it returns normally; on failure/timeout it calls
+            // enterDeepSleep() and never returns to this point.
+            enterPairingMode();
+
+            // Pairing completed — restart to reconnect with new credentials
+            // (same pattern as button hold re-pair at handleButtonHold)
+            logMessage(LOG_INFO, "WS", "Pairing complete - restarting");
+            ESP.restart();
             return;
         }
 
@@ -4216,41 +4085,6 @@ private:
     static void handleWebSocketReconnection() {
         const AppConfig& cfg = ConfigManager::getConfig();
 
-        // Handle OAuth QR code mode - special reconnection behavior while waiting for user to link
-        // Device displays QR code and periodically checks if linking has been completed
-        if (showingOAuthQR) {
-            const uint32_t now = millis();
-            const uint32_t elapsed = now - qrDisplayStartTime;
-
-            // Timeout after 10 minutes - enter deep sleep to conserve battery
-            // User can wake device by pressing button to try again
-            if (elapsed > QR_DISPLAY_TIMEOUT_MS) {
-                logMessage(LOG_INFO, "WS", "OAuth QR timeout - entering deep sleep");
-                showingOAuthQR = false;
-                oauthUrl = "";
-                qrDisplayStartTime = 0;
-
-                DisplayManager::showMessage("Link timeout", "Scan QR to link",
-                                          "Device sleeping", "Press button to wake");
-                delay(2000);
-                enterDeepSleep(10);  // Sleep for 10 minutes, will reset QR state on wake
-                return;
-            }
-
-            // Reconnect every 60 seconds to check if user has completed linking
-            if (now - lastReconnect > QR_RECONNECT_INTERVAL_MS) {
-                lastReconnect = now;
-                logMessage(LOG_INFO, "WS", "Checking if device is now linked...");
-
-                // Disconnect cleanly before reconnect attempt
-                webSocket.disconnect();
-                delay(100);
-
-                connectWebSocket();
-            }
-            return;
-        }
-
         // Don't reconnect if registration permanently failed
         if (registrationFailedPermanently) {
             return;
@@ -4309,7 +4143,7 @@ private:
 // Button Hold Handler — shared by deep sleep wake and main loop
 // ============================================================================
 // Handles tiered button press on GPIO 39 (boot button):
-//   3-9 seconds:  Show "Add Platform" QR code for multi-platform linking
+//   3-9 seconds:  Enter pairing mode for multi-platform linking
 //   10+ seconds:  Enter WiFi provisioning portal
 //
 // When needsInit=true (deep sleep wake), loads config and initializes display.
@@ -4355,8 +4189,8 @@ void handleButtonHold(bool needsInit) {
         SlackNetworkManager::startProvisioning(true);
 
     } else if (pressDuration >= 3000) {
-        // 3-9 seconds = "Add platform" QR code
-        logMessage(LOG_INFO, "CONFIG", "Medium press detected - showing add-platform QR code");
+        // 3-9 seconds = Enter pairing mode to add another platform
+        logMessage(LOG_INFO, "CONFIG", "Medium press detected - entering pairing mode");
 
         if (needsInit && !showedFeedback) {
             ConfigManager::begin();
@@ -4371,43 +4205,14 @@ void handleButtonHold(bool needsInit) {
         const AppConfig& btnCfg = ConfigManager::getConfig();
 
         if (btnCfg.security.auth_token.length() > 0) {
-            // Build connect URL with device credentials for multi-platform linking
-            String protocol = btnCfg.server.use_ssl ? "https://" : "http://";
-            String connectUrl = protocol + btnCfg.server.host;
-            if ((btnCfg.server.use_ssl && btnCfg.server.port != 443) ||
-                (!btnCfg.server.use_ssl && btnCfg.server.port != 80)) {
-                connectUrl += ":" + String(btnCfg.server.port);
-            }
-            connectUrl += "/connect?device_id=" + btnCfg.device.id;
-            connectUrl += "&token=" + btnCfg.security.auth_token;
+            logMessage(LOG_INFO, "CONFIG", "Re-entering pairing mode for platform linking");
 
-            DisplayManager::showOAuthQRCode(connectUrl);
-            logMessage(LOG_INFO, "CONFIG", "Add-platform QR code displayed");
+            enterPairingMode();
 
-            // Wait 3 minutes for user to scan QR and complete OAuth, then restart.
-            // Restart re-establishes the WebSocket connection so the server streams
-            // reactions from all linked platforms (not just the original one).
-            // Button press during wait dismisses immediately and restarts.
-            logMessage(LOG_INFO, "CONFIG", "Waiting 3 minutes for platform linking (press button to dismiss)");
-            unsigned long qrStart = millis();
-            while ((millis() - qrStart) < 180000) {
-                if (digitalRead(GPIO_NUM_39) == LOW) {
-                    logMessage(LOG_INFO, "CONFIG", "Button pressed - dismissing QR code");
-                    while (digitalRead(GPIO_NUM_39) == LOW) { delay(50); }
-                    break;
-                }
-                delay(100);
-            }
-
-            if (!isUSBPowered()) {
-                esp_sleep_enable_ext0_wakeup(GPIO_NUM_39, 0);
-                esp_deep_sleep_start();
-            } else {
-                logMessage(LOG_INFO, "CONFIG", "Restarting to reconnect with all linked platforms");
-                ESP.restart();
-            }
+            // Pairing completed — restart to reconnect with all linked platforms
+            ESP.restart();
         } else {
-            logMessage(LOG_WARN, "CONFIG", "Cannot show add-platform QR - device not paired yet");
+            logMessage(LOG_WARN, "CONFIG", "Cannot enter pairing mode - device not paired yet");
             DisplayManager::showMessage("Not paired yet", "Complete initial setup first");
             delay(5000);
         }
