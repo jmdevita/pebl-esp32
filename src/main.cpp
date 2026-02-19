@@ -2996,7 +2996,7 @@ void handleWebSocketMessage(const uint8_t* payload, size_t length) {
     if (SecurityManager::isEnabled() && message.indexOf("ephemeral_public_key") > 0) {
         logMessage(LOG_DEBUG, "SECURITY", "Received ECDH encrypted message");
 
-        // Decrypt the ECDH envelope (JSON → ECDH + HKDF + AES-256-CBC → plaintext JSON)
+        // Decrypt the ECDH envelope (JSON → ECDH + HKDF + AES-256-GCM → plaintext JSON)
         String decrypted = SecurityManager::decryptECDH(message);
         if (decrypted.isEmpty()) {
             logMessage(LOG_ERROR, "SECURITY", "Failed to decrypt ECDH message");

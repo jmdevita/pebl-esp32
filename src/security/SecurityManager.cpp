@@ -248,17 +248,19 @@ String SecurityManager::getPublicKeyPEM() {
 // HKDF-SHA256 (manual implementation for ESP32 compatibility)
 // ============================================================================
 
-bool SecurityManager::hkdfSHA256(const uint8_t* ikm, size_t ikmLen, uint8_t* okm, size_t okmLen) {
-    // HKDF with salt=NULL, info="aes-key", length=32
+bool SecurityManager::hkdfSHA256(const uint8_t* ikm, size_t ikmLen, const uint8_t* salt, size_t saltLen, uint8_t* okm, size_t okmLen) {
+    // HKDF with caller-provided salt, info="aes-key", length=32
     // Step 1: Extract — PRK = HMAC-SHA256(salt, IKM)
-    // When salt is NULL, use a zero-filled buffer of hash length (32 bytes)
-    uint8_t salt[32] = {0};
+    // When salt is NULL, use a zero-filled buffer of hash length (32 bytes per RFC 5869)
+    uint8_t zeroSalt[32] = {0};
+    const uint8_t* effectiveSalt = (salt != NULL && saltLen > 0) ? salt : zeroSalt;
+    size_t effectiveSaltLen = (salt != NULL && saltLen > 0) ? saltLen : 32;
     uint8_t prk[32];
 
     const mbedtls_md_info_t* md_info = mbedtls_md_info_from_type(MBEDTLS_MD_SHA256);
     if (!md_info) return false;
 
-    int ret = mbedtls_md_hmac(md_info, salt, 32, ikm, ikmLen, prk);
+    int ret = mbedtls_md_hmac(md_info, effectiveSalt, effectiveSaltLen, ikm, ikmLen, prk);
     if (ret != 0) return false;
 
     // Step 2: Expand — T(1) = HMAC-SHA256(PRK, info || 0x01)
@@ -302,8 +304,10 @@ String SecurityManager::decryptECDH(const String& envelopeJson) {
     const char* encryptedB64 = doc["encrypted"];
     const char* ephemeralPem = doc["ephemeral_public_key"];
     const char* ivB64 = doc["iv"];
+    const char* tagB64 = doc["tag"];
+    const char* saltB64 = doc["salt"];
 
-    if (!encryptedB64 || !ephemeralPem || !ivB64) {
+    if (!encryptedB64 || !ephemeralPem || !ivB64 || !tagB64 || !saltB64) {
         logMessage("ERROR", "SECURITY", "ECDH envelope missing required fields");
         return "";
     }
@@ -389,9 +393,19 @@ String SecurityManager::decryptECDH(const String& envelopeJson) {
             goto decrypt_cleanup;
         }
 
-        // 5. HKDF(SHA256, salt=NULL, info="aes-key", length=32) -> AES key
+        // 5. Base64-decode HKDF salt and derive AES key
+        uint8_t hkdfSalt[16];
+        size_t hkdfSaltLen = 0;
+        ret = mbedtls_base64_decode(hkdfSalt, 16, &hkdfSaltLen,
+                                     (const unsigned char*)saltB64, strlen(saltB64));
+        if (ret != 0 || hkdfSaltLen != 16) {
+            logMessage("ERROR", "SECURITY", "Failed to decode HKDF salt");
+            memset(sharedSecret, 0, sizeof(sharedSecret));
+            goto decrypt_cleanup;
+        }
+
         uint8_t aesKey[32];
-        if (!hkdfSHA256(sharedSecret, 32, aesKey, 32)) {
+        if (!hkdfSHA256(sharedSecret, 32, hkdfSalt, hkdfSaltLen, aesKey, 32)) {
             logMessage("ERROR", "SECURITY", "HKDF derivation failed");
             memset(sharedSecret, 0, sizeof(sharedSecret));
             goto decrypt_cleanup;
@@ -400,13 +414,24 @@ String SecurityManager::decryptECDH(const String& envelopeJson) {
         // Zero shared secret immediately
         memset(sharedSecret, 0, sizeof(sharedSecret));
 
-        // 6. Base64-decode IV (16 bytes)
-        uint8_t iv[16];
+        // 6. Base64-decode IV (12 bytes — GCM standard per NIST SP 800-38D)
+        uint8_t iv[12];
         size_t ivLen = 0;
-        ret = mbedtls_base64_decode(iv, 16, &ivLen,
+        ret = mbedtls_base64_decode(iv, 12, &ivLen,
                                      (const unsigned char*)ivB64, strlen(ivB64));
-        if (ret != 0 || ivLen != 16) {
+        if (ret != 0 || ivLen != 12) {
             logMessage("ERROR", "SECURITY", "Failed to decode IV");
+            memset(aesKey, 0, sizeof(aesKey));
+            goto decrypt_cleanup;
+        }
+
+        // Base64-decode GCM authentication tag (16 bytes)
+        uint8_t tag[16];
+        size_t tagLen = 0;
+        ret = mbedtls_base64_decode(tag, 16, &tagLen,
+                                     (const unsigned char*)tagB64, strlen(tagB64));
+        if (ret != 0 || tagLen != 16) {
+            logMessage("ERROR", "SECURITY", "Failed to decode GCM tag");
             memset(aesKey, 0, sizeof(aesKey));
             goto decrypt_cleanup;
         }
@@ -426,49 +451,47 @@ String SecurityManager::decryptECDH(const String& envelopeJson) {
             goto decrypt_cleanup;
         }
 
-        // 7. AES-256-CBC decrypt
-        mbedtls_aes_context aesCtx;
-        mbedtls_aes_init(&aesCtx);
-        ret = mbedtls_aes_setkey_dec(&aesCtx, aesKey, 256);
+        // 7. AES-256-GCM authenticated decrypt
+        // GCM verifies the authentication tag, preventing ciphertext tampering
+        mbedtls_gcm_context gcmCtx;
+        mbedtls_gcm_init(&gcmCtx);
+        ret = mbedtls_gcm_setkey(&gcmCtx, MBEDTLS_CIPHER_ID_AES, aesKey, 256);
 
-        // Zero AES key after setting up context
         memset(aesKey, 0, sizeof(aesKey));
 
         if (ret != 0) {
-            logMessage("ERROR", "SECURITY", "AES key setup failed");
-            mbedtls_aes_free(&aesCtx);
+            logMessage("ERROR", "SECURITY", "GCM key setup failed");
+            mbedtls_gcm_free(&gcmCtx);
             delete[] ciphertext;
             goto decrypt_cleanup;
         }
 
         uint8_t* plaintext = new uint8_t[ciphertextLen + 1];
-        ret = mbedtls_aes_crypt_cbc(&aesCtx, MBEDTLS_AES_DECRYPT,
-                                     ciphertextLen, iv,
-                                     ciphertext, plaintext);
+        ret = mbedtls_gcm_auth_decrypt(&gcmCtx, ciphertextLen,
+                                        iv, ivLen,       // 12-byte IV
+                                        NULL, 0,         // no additional authenticated data
+                                        tag, 16,         // GCM auth tag
+                                        ciphertext, plaintext);
 
-        mbedtls_aes_free(&aesCtx);
+        mbedtls_gcm_free(&gcmCtx);
         delete[] ciphertext;
 
         if (ret != 0) {
-            logMessage("ERROR", "SECURITY", "AES-CBC decrypt failed");
+            // ret == MBEDTLS_ERR_GCM_AUTH_FAILED means tag verification failed (tampering)
+            char buf[32];
+            snprintf(buf, sizeof(buf), "error=0x%04x", -ret);
+            logMessage("ERROR", "SECURITY", "AES-GCM decrypt/auth failed", buf);
             delete[] plaintext;
             goto decrypt_cleanup;
         }
 
-        // 8. PKCS7 unpad
-        size_t plaintextLen = removePadding(plaintext, ciphertextLen);
-        if (plaintextLen == 0) {
-            logMessage("ERROR", "SECURITY", "Invalid PKCS7 padding");
-            delete[] plaintext;
-            goto decrypt_cleanup;
-        }
-
-        plaintext[plaintextLen] = '\0';
-        result = String((char*)plaintext, plaintextLen);
+        // GCM output is exact plaintext length — no padding to remove
+        plaintext[ciphertextLen] = '\0';
+        result = String((char*)plaintext, ciphertextLen);
         delete[] plaintext;
 
         char logBuf[64];
-        snprintf(logBuf, sizeof(logBuf), "decrypted_len=%zu", plaintextLen);
+        snprintf(logBuf, sizeof(logBuf), "decrypted_len=%zu", ciphertextLen);
         logMessage("DEBUG", "SECURITY", "ECDH decryption successful", logBuf);
     }
 
@@ -479,30 +502,6 @@ decrypt_cleanup:
     mbedtls_pk_free(&ephPk);
 
     return result;
-}
-
-// ============================================================================
-// PKCS7 Padding
-// ============================================================================
-
-size_t SecurityManager::removePadding(uint8_t* data, size_t dataLen) {
-    if (dataLen == 0) return 0;
-
-    uint8_t paddingLen = data[dataLen - 1];
-
-    // Validate padding value is within valid range for AES block size
-    if (paddingLen == 0 || paddingLen > 16) {
-        return 0;
-    }
-
-    // Verify all padding bytes match
-    for (size_t i = 1; i <= paddingLen; i++) {
-        if (data[dataLen - i] != paddingLen) {
-            return 0;
-        }
-    }
-
-    return dataLen - paddingLen;
 }
 
 // ============================================================================

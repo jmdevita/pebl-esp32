@@ -12,6 +12,7 @@
 #include <mbedtls/ecdh.h>
 #include <mbedtls/pk.h>
 #include <mbedtls/aes.h>
+#include <mbedtls/gcm.h>
 #include <mbedtls/md.h>
 #include <mbedtls/base64.h>
 #include <mbedtls/entropy.h>
@@ -20,7 +21,7 @@
 // ECDH P-256 encryption manager
 // Device generates a keypair on first boot, stores the private key in NVS,
 // and uploads the public key to the server. Per-message decryption uses
-// ECDH + HKDF-SHA256 + AES-256-CBC to match the server's wire format.
+// ECDH + HKDF-SHA256 + AES-256-GCM to match the server's wire format.
 class SecurityManager {
 private:
     static uint8_t privateKey[32];   // P-256 private scalar, loaded from NVS
@@ -30,9 +31,6 @@ private:
     // Logging helper
     static void logMessage(const char* level, const char* module, const char* message, const char* details = nullptr);
 
-    // PKCS7 padding helpers
-    static size_t removePadding(uint8_t* data, size_t dataLen);
-
     // NVS operations
     static bool loadKeyFromNVS();
     static bool generateAndSaveKey();
@@ -41,8 +39,8 @@ private:
     // Returns number of bytes written (including null terminator), or 0 on failure
     static size_t derivePublicKeyPEM(char* buf, size_t bufSize);
 
-    // HKDF-SHA256: extract-then-expand with salt=NULL, info="aes-key", length=32
-    static bool hkdfSHA256(const uint8_t* ikm, size_t ikmLen, uint8_t* okm, size_t okmLen);
+    // HKDF-SHA256: extract-then-expand with caller-provided salt, info="aes-key", length=32
+    static bool hkdfSHA256(const uint8_t* ikm, size_t ikmLen, const uint8_t* salt, size_t saltLen, uint8_t* okm, size_t okmLen);
 
 public:
     // Load key from NVS or generate on first boot
@@ -51,7 +49,7 @@ public:
     // Zero private key from RAM
     static void cleanup();
 
-    // Decrypt ECDH envelope JSON: {"encrypted": b64, "ephemeral_public_key": PEM, "iv": b64}
+    // Decrypt ECDH envelope JSON: {"encrypted": b64, "ephemeral_public_key": PEM, "iv": b64, "tag": b64, "salt": b64}
     static String decryptECDH(const String& envelopeJson);
 
     // Get PEM-encoded public key for display/debugging
