@@ -2626,6 +2626,10 @@ void enterPairingMode() {
                     // Continue anyway - token is in memory for this boot session
                 }
 
+                // New pairing = new server-side user record, so the ECDH public
+                // key must be re-uploaded for the server to encrypt messages.
+                SecurityManager::resetKeyUploaded();
+
                 DisplayManager::showMessage(
                     "Paired!",
                     "Device linked",

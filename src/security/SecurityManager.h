@@ -61,6 +61,11 @@ public:
     // Check if key has been uploaded to server (persisted in NVS)
     static bool isKeyUploaded() { return keyUploaded; }
 
+    // Reset the uploaded flag so the key is re-uploaded on next boot.
+    // Called after re-pairing (new auth token = new server-side user association,
+    // so the server needs the public key re-uploaded for the new user record).
+    static void resetKeyUploaded();
+
     // Check if ECDH keypair is loaded and ready
     static bool isEnabled() { return initialized; }
 };

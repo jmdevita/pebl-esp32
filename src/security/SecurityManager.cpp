@@ -504,6 +504,16 @@ decrypt_cleanup:
     return result;
 }
 
+void SecurityManager::resetKeyUploaded() {
+    Preferences prefs;
+    if (prefs.begin(NVS_NAMESPACE, false)) {
+        prefs.putBool(NVS_KEY_UPLOADED, false);
+        prefs.end();
+    }
+    keyUploaded = false;
+    logMessage("INFO", "SECURITY", "Key upload flag reset (will re-upload on next boot)");
+}
+
 // ============================================================================
 // Key Upload
 // ============================================================================
