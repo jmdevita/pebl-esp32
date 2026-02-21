@@ -155,7 +155,7 @@ namespace BatteryConstants {
     // Sleep thresholds
     constexpr int LOW_BATTERY_SLEEP_THRESHOLD = 15;        // Sleep immediately below 15% (balanced runtime vs longevity)
     constexpr unsigned long GRACE_PERIOD_MS = 60000;       // 60s grace after switching to battery
-    constexpr unsigned long MAX_BATTERY_RUNTIME_MS = 20000; // 20sec max runtime on battery (allows emoji downloads + WiFi variance)
+    constexpr unsigned long MAX_BATTERY_RUNTIME_MS = 30000; // 30sec max runtime on battery (~16s listening after connection overhead)
 
     // ADC configuration
     constexpr int ADC_SAMPLE_COUNT = 20;                   // Samples for averaging (increased from 10 for WiFi noise rejection)
@@ -265,7 +265,7 @@ RTC_DATA_ATTR bool hasShownLowBatteryWarning = false;  // Track if low battery w
 
 // Track if device woke from sleep on battery (survives deep sleep)
 // Used to differentiate between two battery scenarios with different timeout behaviors:
-// - Wake on battery: Device was already unplugged before sleep (use 20s timeout for efficiency)
+// - Wake on battery: Device was already unplugged before sleep (use 45s timeout for efficiency)
 // - USB unplugged: Transitioned from USB→battery while awake (use 60s grace period for stability)
 RTC_DATA_ATTR bool wokeOnBattery = false;
 
@@ -951,8 +951,9 @@ public:
             display->fillScreen(GxEPD_WHITE);
             display->setTextColor(GxEPD_BLACK);
 
-            // Battery indicator top-right
+            // Battery indicator top-right (dots) and power status text top-center ("BATTERY" / "LOW BATT")
             drawBatteryIndicator();
+            drawPowerStatusIndicator();
 
             // Lock icon if encryption enabled
             if (showLockIcon) {
@@ -2928,8 +2929,13 @@ void webSocketEvent(WStype_t type, uint8_t* payload, size_t length) {
                 lastOTACheckMillis = millis();
             }
 
-            // Update display based on what was showing before reconnection
+            // Update display based on what was showing before reconnection.
+            // Save justWokeFromSleep before clearing — the wake block already did a full
+            // display refresh, so we skip showConnectedScreen() to avoid a double refresh
+            // that wastes ~4.3s on DEPG displays (the most impactful battery mode fix).
+            bool wasJustWoken = justWokeFromSleep;
             justWokeFromSleep = false;
+
             if (displayShowingConnectionLost && lastReaction.hasReaction) {
                 // "Connection Lost" was displayed over the last reaction — re-render it
                 displayShowingConnectionLost = false;
@@ -2944,12 +2950,16 @@ void webSocketEvent(WStype_t type, uint8_t* payload, size_t length) {
                 doc["platform"] = lastReaction.platform;
                 doc["encrypted"] = lastReaction.isEncrypted;
                 DisplayManager::showReaction(doc.as<JsonObject>());
-            } else if (!lastReaction.hasReaction) {
-                // First-ever connection (no reaction received yet)
+            } else if (!lastReaction.hasReaction && !wasJustWoken) {
+                // First-ever connection AND not waking from sleep (wake block already refreshed).
+                // Show the "waiting for reactions" screen since this is the initial connection.
                 displayShowingConnectionLost = false;
                 DisplayManager::showConnectedScreen(SecurityManager::isEnabled());
+                hasShownBlankScreen = true;  // Prevent redundant blank screen on first wake
             } else {
-                // Normal reconnect with reaction still on screen (no "Connection Lost" was shown)
+                // Normal reconnect OR wake-from-sleep — preserve current display.
+                // On wake: the wake block already showed a status screen, no need for a second refresh.
+                // On reconnect: the last reaction or status screen is still valid.
                 logMessage(LOG_INFO, "WS", "Connected - preserving display");
             }
             break;
@@ -4943,10 +4953,15 @@ void loop() {
                         shouldSleep = true;
                         sleepReason = "no_connection";
                     }
-                    // Sleep if timeout exceeded
-                    else {
+                    // When connected, extend by 15s to receive pending messages before sleeping.
+                    // This covers the case where a reaction arrives just as the timeout fires —
+                    // without the extension, the device would sleep before processing it.
+                    else if (timeOnBattery > sleepTimeout + 15000) {
                         shouldSleep = true;
-                        sleepReason = timeoutReason;
+                        sleepReason = "connected_timeout";
+                    }
+                    else {
+                        logMessage(LOG_DEBUG, "POWER", "Connected - extending wake for message reception");
                     }
 
                     if (shouldSleep) {
