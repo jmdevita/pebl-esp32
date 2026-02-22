@@ -3881,6 +3881,50 @@ public:
         wm.addParameter(&custom_html_text);
         wm.addParameter(&custom_device_id);
 
+        // Portal branding and styling to match PEBL website design language.
+        // Colors: warm cream bg (#faf8f4), dark charcoal buttons (#1c1c1e),
+        // secondary text (#6b6560), subtle borders (#eee8df).
+        // Fonts fall back to system sans-serif since Google Fonts won't load
+        // on the local AP (no internet connectivity during provisioning).
+        wm.setTitle("pebl");
+        wm.setCustomHeadElement(
+            "<style>"
+            "body{background:#faf8f4;color:#1c1c1e;"
+                "font-family:-apple-system,system-ui,sans-serif;}"
+            "h1{font-size:1.6rem;letter-spacing:2px;margin-bottom:0;}"
+            "h3{color:#6b6560;font-weight:400;font-size:0.95rem;margin-top:4px;}"
+            "a{color:#1c1c1e;}"
+            "a:hover{color:#6b6560;}"
+            "button,input[type='submit']{background:#1c1c1e;color:#faf8f4;"
+                "border-radius:10px;border:0;line-height:2.6rem;font-size:1rem;"
+                "font-weight:600;transition:opacity 0.2s;}"
+            "button:hover{opacity:0.85;}"
+            "button.D{background:#c2410c;}"
+            "input,select{border:1px solid #eee8df;border-radius:10px;"
+                "padding:10px 12px;font-size:1rem;background:#fff;}"
+            "input:focus{border-color:#1c1c1e;outline:none;}"
+            "label{color:#6b6560;font-size:0.85rem;}"
+            ".msg{border-color:#eee8df;border-radius:10px;background:#fff;}"
+            ".msg.S{border-left-color:#4ade80;}"
+            ".msg.S h4{color:#4ade80;}"
+            ".msg.D{border-left-color:#c2410c;}"
+            ".msg.D h4{color:#c2410c;}"
+            "hr{border:none;border-top:1px solid #eee8df;}"
+            ".btn-outline{background:#faf8f4;color:#1c1c1e;"
+                "border:1px solid #eee8df !important;}"
+            ".btn-outline:hover{border-color:#1c1c1e !important;}"
+            "</style>"
+        );
+
+        // Configure portal menu with "Clear Saved Networks" button.
+        // Uses outline style (btn-outline) to visually separate it as a secondary action.
+        const char* menuItems[] = {"wifi", "wifinoscan", "info", "custom", "sep", "restart", "exit"};
+        wm.setMenu(menuItems, 7);
+        wm.setCustomMenuHTML(
+            "<form action='/clear-networks' method='post'>"
+            "<button class='btn-outline'>Clear Saved Networks</button></form><br/>"
+        );
+
         // Flag to track if we should save custom parameters
         bool shouldSaveConfig = false;
 
@@ -3900,6 +3944,31 @@ public:
             shouldSaveConfig = true;
             logMessage(LOG_INFO, "WIFI", "Configuration save callback triggered");
             DisplayManager::showMessage("Config Saved!", "Processing...");
+        });
+
+        // Bind custom route for clearing saved WiFi networks from NVS.
+        // Accessible from the portal menu — independent of WiFi configuration.
+        wm.setWebServerCallback([&wm]() {
+            wm.server->on("/clear-networks", HTTP_POST, [&wm]() {
+                WiFiCredentialManager::begin();
+                WiFiCredentialManager::clearNVS();
+                logMessage(LOG_INFO, "WIFI", "Saved networks cleared via portal");
+                wm.server->send(200, "text/html",
+                    "<html><head><meta name='viewport' content='width=device-width,initial-scale=1'>"
+                    "<style>body{background:#faf8f4;color:#1c1c1e;"
+                    "font-family:-apple-system,system-ui,sans-serif;"
+                    "text-align:center;padding:40px 20px;}"
+                    "h2{font-size:1.4rem;margin-bottom:8px;}"
+                    "p{color:#6b6560;font-size:0.95rem;}"
+                    "a{display:inline-block;margin-top:16px;background:#1c1c1e;"
+                    "color:#faf8f4;padding:10px 28px;border-radius:10px;"
+                    "text-decoration:none;font-weight:600;}"
+                    "a:hover{opacity:0.85;}</style></head>"
+                    "<body><h2>Networks Cleared</h2>"
+                    "<p>All saved WiFi networks have been removed.</p>"
+                    "<p>Seed networks from config will reload on next boot.</p>"
+                    "<a href='/'>Back</a></body></html>");
+            });
         });
 
         // Set timeout for config portal (10 minutes)
