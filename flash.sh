@@ -1,6 +1,6 @@
 #!/bin/bash
 # Flash ESP32 firmware and config to a device
-# Usage: ./flash.sh [--dry-run]
+# Usage: ./flash.sh [--dry-run] [--erase]
 
 set -e
 
@@ -18,9 +18,11 @@ DEFAULT_ROTATION=1
 
 # Parse arguments
 DRY_RUN=false
+ERASE=false
 for arg in "$@"; do
     case "$arg" in
         --dry-run) DRY_RUN=true ;;
+        --erase)   ERASE=true ;;
     esac
 done
 
@@ -42,7 +44,11 @@ echo -e "${BOLD}╔════════════════════�
 if $DRY_RUN; then
 echo -e "${BOLD}║  ESP32 E-Paper Flasher ${YELLOW}(DRY RUN)${NC}${BOLD}   ║${NC}"
 else
+if $ERASE; then
+echo -e "${BOLD}║  ESP32 E-Paper Flasher ${RED}(ERASE)${NC}${BOLD}      ║${NC}"
+else
 echo -e "${BOLD}║     ESP32 E-Paper Device Flasher     ║${NC}"
+fi
 fi
 echo -e "${BOLD}╚══════════════════════════════════════╝${NC}"
 echo ""
@@ -50,6 +56,11 @@ echo ""
 # --- Check prerequisites ---
 if ! command -v pio &> /dev/null; then
     error "PlatformIO CLI not found. Install with: pip install platformio"
+    exit 1
+fi
+
+if $ERASE && ! command -v esptool.py &> /dev/null; then
+    error "esptool.py not found. Install with: pip install esptool"
     exit 1
 fi
 
@@ -145,6 +156,9 @@ printf "${BOLD}│${NC}  %-14s %-22s${BOLD}│${NC}\n" "Name:" "$DEVICE_NAME"
 printf "${BOLD}│${NC}  %-14s %-22s${BOLD}│${NC}\n" "Variant:" "$DISPLAY_VARIANT"
 printf "${BOLD}│${NC}  %-14s %-22s${BOLD}│${NC}\n" "Rotation:" "$DISPLAY_ROTATION"
 printf "${BOLD}│${NC}  %-14s %-22s${BOLD}│${NC}\n" "Device ID:" "(auto from MAC)"
+if $ERASE; then
+printf "${BOLD}│${NC}  %-14s ${RED}%-22s${NC}${BOLD}│${NC}\n" "Erase:" "FULL FLASH WIPE"
+fi
 if $DRY_RUN; then
 printf "${BOLD}│${NC}  %-14s ${YELLOW}%-22s${NC}${BOLD}│${NC}\n" "Mode:" "DRY RUN"
 fi
@@ -190,6 +204,14 @@ CONFIRM="${CONFIRM:-Y}"
 if [[ ! "$CONFIRM" =~ ^[Yy]$ ]]; then
     info "Aborted."
     exit 0
+fi
+
+# --- Erase flash (if requested) ---
+if $ERASE; then
+    echo ""
+    info "Erasing entire flash..."
+    esptool.py --port "$PORT" erase_flash
+    success "Flash erased"
 fi
 
 # --- Flash filesystem (config + certs) ---

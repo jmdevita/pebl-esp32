@@ -1263,15 +1263,16 @@ public:
 
             textY += 14;
             display->setCursor(textX, textY);
-            display->print("Open browser:");
+            display->print("Scan QR or go to");
 
             textY += 10;
             display->setCursor(textX, textY);
-            display->print(ip.c_str());
+            display->print("Settings > WiFi");
 
             textY += 14;
             display->setCursor(textX, textY);
-            display->print("Scan QR to connect");
+            display->print("Portal: ");
+            display->print(ip.c_str());
 
         } while (display->nextPage());
 
@@ -3929,7 +3930,7 @@ public:
         bool shouldSaveConfig = false;
 
         // Set custom AP name
-        const char* apName = "SlackReact-Setup";
+        const char* apName = "pebl-setup";
 
         // Configure callback to show provisioning UI on e-paper (QR code screen)
         wm.setAPCallback([](WiFiManager* myWM) {
