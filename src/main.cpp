@@ -408,17 +408,32 @@ private:
                 b = pPixel[2];
             }
 
+            // Alpha-composite onto white background for types with alpha
+            if (pDraw->iPixelType == 6) {  // RGBA
+                uint8_t a = pPixel[3];
+                r = (uint8_t)((r * a + 255 * (255 - a)) / 255);
+                g = (uint8_t)((g * a + 255 * (255 - a)) / 255);
+                b = (uint8_t)((b * a + 255 * (255 - a)) / 255);
+            } else if (pDraw->iPixelType == 4) {  // Grayscale+Alpha
+                uint8_t a = pPixel[1];
+                r = g = b = (uint8_t)((r * a + 255 * (255 - a)) / 255);
+            }
+
             // Convert to grayscale
             uint16_t gray = ((uint16_t)r + (uint16_t)g + (uint16_t)b) / 3;
 
+            // Gamma correction (γ=2.0): darkens mid-tones so bright colors
+            // like yellow don't wash out into light gray on e-paper.
+            gray = (uint16_t)gray * gray / 255;
+
             // Map grayscale to display color depth
             #ifdef DISPLAY_4G_GRAYSCALE
-                // 4-level grayscale mapping (0-255 → 4 levels)
+                // 4-level grayscale — thresholds tuned for gamma-corrected values
                 uint16_t color;
-                if (gray < 64) color = GxEPD_BLACK;         // 0-63: Black
-                else if (gray < 128) color = GxEPD_DARKGREY;  // 64-127: Dark gray
-                else if (gray < 192) color = GxEPD_LIGHTGREY; // 128-191: Light gray
-                else color = GxEPD_WHITE;                     // 192-255: White
+                if (gray < 32) color = GxEPD_BLACK;
+                else if (gray < 96) color = GxEPD_DARKGREY;
+                else if (gray < 176) color = GxEPD_LIGHTGREY;
+                else color = GxEPD_WHITE;
             #else
                 // 2-level black & white threshold
                 uint16_t color = (gray > 128) ? GxEPD_WHITE : GxEPD_BLACK;
