@@ -1346,15 +1346,10 @@ public:
             drawBatteryIndicator();
             drawPowerStatusIndicator();
 
-            // Title at top
-            display->setFont(&FreeSansBold9pt7b);
-            display->setCursor(10, 14);
-            display->print("Trial Expired");
-
-            // QR code on the left, below title
+            // QR code on the left, below battery indicator row
             const uint8_t scale = 2;
             const int16_t qrX = 5;
-            const int16_t qrY = 18;
+            const int16_t qrY = 20;
 
             for (uint8_t y = 0; y < qrcode.size; y++) {
                 for (uint8_t x = 0; x < qrcode.size; x++) {
@@ -1363,11 +1358,16 @@ public:
                 }
             }
 
-            // Instructions on the right side of QR code
-            display->setFont(nullptr);  // Small default font
+            // Right column: title then instructions
             const int16_t textX = qrX + (qrcode.size * scale) + 5;
-            int16_t textY = qrY + 2;
+            int16_t textY = qrY + 10;
 
+            display->setFont(&FreeSansBold9pt7b);
+            display->setCursor(textX, textY);
+            display->print("Trial Expired");
+
+            display->setFont(nullptr);  // Small default font for instructions
+            textY += 14;
             display->setCursor(textX, textY);
             display->print("Scan to purchase");
 
@@ -1381,7 +1381,7 @@ public:
 
             textY += 10;
             display->setCursor(textX, textY);
-            display->print(deviceId.substring(0, 8).c_str());
+            display->print(deviceId.substring(0, 20).c_str());
 
         } while (display->nextPage());
 
