@@ -209,7 +209,10 @@ namespace {  // Anonymous namespace for internal linkage
     WiFiMulti wifiMulti;
 
     // Connection state - volatile for ISR safety
+    // wsConnected: transport-level WebSocket connection is up
+    // wsRegistered: server confirmed authentication (two-phase handshake complete)
     volatile bool wsConnected = false;
+    volatile bool wsRegistered = false;
 
     // Timing variables
     uint32_t lastHeartbeat = 0;
@@ -2379,6 +2382,37 @@ static String buildServerUrl() {
 }
 
 /**
+ * Determine disconnect reason for user-facing display message.
+ * 3-tier check: WiFi → server /health → assume transient (duplicate rejection, etc.)
+ */
+static String getDisconnectReason() {
+    if (WiFi.status() != WL_CONNECTED) {
+        return "Check WiFi";
+    }
+
+    // WiFi is up — probe server /health to distinguish "server down" from "transient"
+    WiFiClientSecure secureClient;
+    secureClient.setInsecure();  // Matches pairing/OTA/timezone pattern
+
+    HTTPClient http;
+    http.setConnectTimeout(3000);
+    http.setTimeout(3000);
+
+    String url = buildServerUrl() + "/health";
+    if (!http.begin(secureClient, url)) {
+        return "Server Unavailable";
+    }
+
+    int code = http.GET();
+    http.end();
+
+    if (code == 200) {
+        return "Reconnecting...";
+    }
+    return "Server Unavailable";
+}
+
+/**
  * Request a pairing code from the server.
  * POST /api/pairing/request?device_id={id}&device_type=esp32_eink&firmware_version={ver}
  *
@@ -2797,6 +2831,7 @@ void gracefulShutdown(const char* reason, bool clearDisplay = false) {
 
     // Stop accepting new messages
     wsConnected = false;
+    wsRegistered = false;
 
     // Disconnect WebSocket cleanly
     if (WiFi.status() == WL_CONNECTED) {
@@ -2887,6 +2922,7 @@ void webSocketEvent(WStype_t type, uint8_t* payload, size_t length) {
         case WStype_DISCONNECTED: {
             logMessage(LOG_WARN, "WS", "Disconnected");
             wsConnected = false;
+            wsRegistered = false;
             metrics.failedConnections++;
             ResilienceManager::markConnectionLost();  // Track connection loss
 
@@ -2895,7 +2931,7 @@ void webSocketEvent(WStype_t type, uint8_t* payload, size_t length) {
             // After the initial warning, preserve the "Connection Lost" display until reconnected
             if (!enteringSleep && metrics.failedConnections == 10) {
                 displayShowingConnectionLost = true;
-                DisplayManager::showDisconnectedScreen("Check WiFi/Server");
+                DisplayManager::showDisconnectedScreen(getDisconnectReason());
             }
             break;
         }
@@ -2903,20 +2939,21 @@ void webSocketEvent(WStype_t type, uint8_t* payload, size_t length) {
         case WStype_CONNECTED: {
             char logBuf[128];
             snprintf(logBuf, sizeof(logBuf), "url=%s", reinterpret_cast<char*>(payload));
-            logMessage(LOG_INFO, "WS", "Connected", logBuf);
+            logMessage(LOG_INFO, "WS", "Connected (transport)", logBuf);
             wsConnected = true;
+            wsRegistered = false;  // Wait for server "registered" confirmation
             lastHeartbeat = millis();  // Initialize heartbeat timer on connection
             metrics.totalConnections++;
             metrics.failedConnections = 0;  // Reset failed counter on successful connection
             registrationErrorCount = 0;  // Reset registration error tracking on successful connection
             registrationFailedPermanently = false;
 
-            ResilienceManager::markConnectionRestored();  // Track restoration
-            ResilienceManager::recordHeartbeat();  // Record initial heartbeat
             const AppConfig& cfg = ConfigManager::getConfig();
 
             // Send registration message with auth_token (mandatory two-factor auth)
             // ECDH public key is uploaded separately via /upload endpoint (not in registration)
+            // Server will respond with {"type":"registered"} on success, completing the
+            // two-phase handshake. Display updates and OTA checks are deferred until then.
             JsonDocument regDoc;
             regDoc["type"] = "register";
             regDoc["device_type"] = "esp32_eink";
@@ -2926,58 +2963,6 @@ void webSocketEvent(WStype_t type, uint8_t* payload, size_t length) {
             serializeJson(regDoc, regMsg);
             webSocket.sendTXT(regMsg);
             logMessage(LOG_INFO, "WS", "Sent registration with auth_token");
-
-            // Check for firmware updates on first WebSocket connection (power-on boot only)
-            // Timing: Performed here instead of immediately after WiFi connect ensures DNS has fully
-            // propagated and stabilized. WebSocket connection success confirms DNS is working.
-            // This prevents spurious "DNS Failed" errors during OTA hostname resolution.
-            if (!otaCheckedThisBoot && !justWokeFromSleep) {
-                otaCheckedThisBoot = true;  // Mark as checked to prevent duplicate checks on reconnects
-                logMessage(LOG_INFO, "OTA", "First connection established - checking for firmware updates");
-
-                // DNS stabilization: Allow additional time after WebSocket connection before making
-                // new DNS queries. Even though WebSocket connected successfully, the DNS resolver
-                // may need time to fully stabilize its cache and state. This prevents transient
-                // "DNS Failed" errors on the first HTTP request after WebSocket establishment.
-                delay(2000);  // 2-second stabilization period
-
-                checkForFirmwareUpdate();
-                lastOTACheckMillis = millis();
-            }
-
-            // Update display based on what was showing before reconnection.
-            // Save justWokeFromSleep before clearing — the wake block already did a full
-            // display refresh, so we skip showConnectedScreen() to avoid a double refresh
-            // that wastes ~4.3s on DEPG displays (the most impactful battery mode fix).
-            bool wasJustWoken = justWokeFromSleep;
-            justWokeFromSleep = false;
-
-            if (displayShowingConnectionLost && lastReaction.hasReaction) {
-                // "Connection Lost" was displayed over the last reaction — re-render it
-                displayShowingConnectionLost = false;
-                logMessage(LOG_INFO, "WS", "Reconnected - restoring last reaction");
-
-                JsonDocument doc;
-                doc["emoji"] = lastReaction.emoji;
-                doc["emoji_url"] = lastReaction.emojiUrl;
-                doc["user"] = lastReaction.user;
-                doc["channel"] = lastReaction.channel;
-                doc["message"] = lastReaction.message;
-                doc["platform"] = lastReaction.platform;
-                doc["encrypted"] = lastReaction.isEncrypted;
-                DisplayManager::showReaction(doc.as<JsonObject>());
-            } else if (!lastReaction.hasReaction && !wasJustWoken) {
-                // First-ever connection AND not waking from sleep (wake block already refreshed).
-                // Show the "waiting for reactions" screen since this is the initial connection.
-                displayShowingConnectionLost = false;
-                DisplayManager::showConnectedScreen(SecurityManager::isEnabled());
-                hasShownBlankScreen = true;  // Prevent redundant blank screen on first wake
-            } else {
-                // Normal reconnect OR wake-from-sleep — preserve current display.
-                // On wake: the wake block already showed a status screen, no need for a second refresh.
-                // On reconnect: the last reaction or status screen is still valid.
-                logMessage(LOG_INFO, "WS", "Connected - preserving display");
-            }
             break;
         }
 
@@ -3060,6 +3045,60 @@ void handleWebSocketMessage(const uint8_t* payload, size_t length) {
     }
 
     // Use string comparison with early returns for efficiency
+
+    // Server confirms authentication — two-phase handshake complete.
+    // Display updates and OTA checks are deferred until this point so
+    // we know the server accepted us as a valid, authenticated device.
+    if (strcmp(msgType, "registered") == 0) {
+        logMessage(LOG_INFO, "WS", "Registration confirmed by server");
+        wsRegistered = true;
+        ResilienceManager::markConnectionRestored();
+        ResilienceManager::recordHeartbeat();
+
+        // Check for firmware updates on first registration after power-on boot.
+        // DNS has stabilized by now (WebSocket + registration round-trip succeeded).
+        if (!otaCheckedThisBoot && !justWokeFromSleep) {
+            otaCheckedThisBoot = true;
+            logMessage(LOG_INFO, "OTA", "First connection established - checking for firmware updates");
+            delay(2000);  // DNS stabilization period
+            checkForFirmwareUpdate();
+            lastOTACheckMillis = millis();
+        }
+
+        // Update display based on what was showing before reconnection.
+        // Save justWokeFromSleep before clearing — the wake block already did a full
+        // display refresh, so we skip showConnectedScreen() to avoid a double refresh
+        // that wastes ~4.3s on DEPG displays (the most impactful battery mode fix).
+        bool wasJustWoken = justWokeFromSleep;
+        justWokeFromSleep = false;
+
+        if (displayShowingConnectionLost && lastReaction.hasReaction) {
+            // "Connection Lost" was displayed over the last reaction — re-render it
+            displayShowingConnectionLost = false;
+            logMessage(LOG_INFO, "WS", "Reconnected - restoring last reaction");
+
+            JsonDocument restoreDoc;
+            restoreDoc["emoji"] = lastReaction.emoji;
+            restoreDoc["emoji_url"] = lastReaction.emojiUrl;
+            restoreDoc["user"] = lastReaction.user;
+            restoreDoc["channel"] = lastReaction.channel;
+            restoreDoc["message"] = lastReaction.message;
+            restoreDoc["platform"] = lastReaction.platform;
+            restoreDoc["encrypted"] = lastReaction.isEncrypted;
+            DisplayManager::showReaction(restoreDoc.as<JsonObject>());
+        } else if (!lastReaction.hasReaction && !wasJustWoken) {
+            // First-ever connection AND not waking from sleep (wake block already refreshed).
+            // Show the "waiting for reactions" screen since this is the initial connection.
+            displayShowingConnectionLost = false;
+            DisplayManager::showConnectedScreen(SecurityManager::isEnabled());
+            hasShownBlankScreen = true;
+        } else {
+            // Normal reconnect OR wake-from-sleep — preserve current display.
+            logMessage(LOG_INFO, "WS", "Connected - preserving display");
+        }
+        return;
+    }
+
     if (strcmp(msgType, "heartbeat") == 0) {
         metrics.heartbeatsReceived++;
         ResilienceManager::recordHeartbeat();  // Track for health monitoring
@@ -3140,6 +3179,7 @@ void handleWebSocketMessage(const uint8_t* payload, size_t length) {
 
             logMessage(LOG_INFO, "WS", "Device not linked - entering pairing mode");
             wsConnected = false;
+            wsRegistered = false;
             webSocket.disconnect();
 
             // enterPairingMode() blocks until pairing succeeds or fails.
@@ -3179,6 +3219,7 @@ void handleWebSocketMessage(const uint8_t* payload, size_t length) {
             // Trial expiry is not transient — user must purchase a key before device works again
             registrationFailedPermanently = true;
             wsConnected = false;
+            wsRegistered = false;
             webSocket.disconnect();
 
             logMessage(LOG_INFO, "WS", "Trial expired - entering 60-minute deep sleep",
@@ -3218,6 +3259,7 @@ void handleWebSocketMessage(const uint8_t* payload, size_t length) {
                 // Mark registration as permanently failed (stop reconnecting)
                 registrationFailedPermanently = true;
                 wsConnected = false;
+                wsRegistered = false;
                 webSocket.disconnect();
 
                 // Deep sleep for 10 minutes, then wake to check again
@@ -3252,6 +3294,7 @@ void handleWebSocketMessage(const uint8_t* payload, size_t length) {
                 // Mark registration as permanently failed (stop reconnecting)
                 registrationFailedPermanently = true;
                 wsConnected = false;
+                wsRegistered = false;
                 webSocket.disconnect();
 
                 // Deep sleep for 10 minutes, then wake to check again
@@ -3302,8 +3345,9 @@ void processSerialCommand(const String& command) {
     }
     else if (command.startsWith("TEST:WS")) {
         char buf[128];
-        snprintf(buf, sizeof(buf), "connected=%s device_id=%s",
+        snprintf(buf, sizeof(buf), "connected=%s registered=%s device_id=%s",
                  wsConnected ? "true" : "false",
+                 wsRegistered ? "true" : "false",
                  ConfigManager::getConfig().device.id.c_str());
         logMessage(LOG_TEST, "WS", "Status", buf);
     }
@@ -4215,7 +4259,10 @@ private:
 
     static void checkHeartbeatTimeout() {
         const AppConfig& cfg = ConfigManager::getConfig();
-        if (wsConnected && lastHeartbeat > 0) {
+        // Only check heartbeat timeout after server confirms registration —
+        // before that, we haven't completed the two-phase handshake and
+        // shouldn't trigger reconnects based on missing heartbeats.
+        if (wsRegistered && lastHeartbeat > 0) {
             uint32_t timeSinceHeartbeat = (unsigned long)(millis() - lastHeartbeat);
             // Only disconnect if we haven't received ANY messages (not just heartbeats) for double the timeout
             // The WebSocketsClient has its own ping/pong mechanism that should keep the connection alive
@@ -4226,6 +4273,7 @@ private:
 
                 // Force reconnection
                 wsConnected = false;
+                wsRegistered = false;
                 webSocket.disconnect();
                 lastHeartbeat = 0;
             } else if (timeSinceHeartbeat > ConnectionTiming::HEARTBEAT_TIMEOUT_MS) {
@@ -4788,8 +4836,8 @@ void loop() {
     // Check connection health and process queued messages
     ResilienceManager::checkHealth();
 
-    // Process queued messages if connection is restored
-    if (wsConnected && ResilienceManager::hasQueuedMessages()) {
+    // Process queued messages once fully registered (two-phase handshake complete)
+    if (wsRegistered && ResilienceManager::hasQueuedMessages()) {
         ResilienceManager::processQueuedMessages();
     }
 

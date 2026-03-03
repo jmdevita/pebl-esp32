@@ -553,7 +553,7 @@ bool SecurityManager::uploadPublicKey(const String& serverBaseUrl, const String&
     body += "--" + boundary + "--\r\n";
 
     // Server expects token, name, key_type as query parameters (not form fields)
-    String uploadUrl = serverBaseUrl + "/slack/upload?token=" + authToken
+    String uploadUrl = serverBaseUrl + "/upload?token=" + authToken
                      + "&name=" + deviceId + "&key_type=ECDH-P256";
     HTTPClient http;
     WiFiClientSecure client;
