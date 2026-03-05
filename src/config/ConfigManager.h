@@ -95,6 +95,11 @@ struct AppConfig {
     struct {
         bool skip_refresh_on_no_message;  // Skip full refresh on wake if no new reaction (default: true)
     } display_policy;
+
+    // OTA update settings
+    struct {
+        bool enabled;  // Enable/disable OTA firmware updates (default: true)
+    } ota;
 };
 
 class ConfigManager {

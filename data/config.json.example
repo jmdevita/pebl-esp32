@@ -54,5 +54,9 @@
   "display_policy": {
     "skip_refresh_on_no_message": true,
     "_comment": "skip_refresh_on_no_message saves battery by only refreshing when new reactions arrive or power state changes."
+  },
+  "ota": {
+    "enabled": true,
+    "_comment": "Set to false to disable automatic firmware updates. Useful for self-hosted servers or custom firmware builds."
   }
 }

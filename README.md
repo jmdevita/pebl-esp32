@@ -1,6 +1,6 @@
 # ESP32 Arduino Client
 
-Arduino/C++ client for LilyGo T5 e-paper displays. Shows real-time Slack and Discord reactions with power management and battery monitoring.
+Arduino/C++ client for LilyGo T5 e-paper displays. Shows real-time Slack and Discord reactions with power management and battery monitoring. Part of [Pebl](https://pebl.ink).
 
 ## Supported Devices
 

@@ -20,6 +20,14 @@ OTAManager::OTAManager(const String& serverUrl, const String& deviceId)
 bool OTAManager::checkForUpdate(FirmwareInfo& info) {
     status = OTAStatus::CHECKING;
 
+    // Check if OTA updates are enabled in config (allows users to opt out)
+    if (!ConfigManager::getConfig().ota.enabled) {
+        lastError = "OTA disabled in config";
+        status = OTAStatus::IDLE;
+        Serial.println("[OTA] Updates disabled via config.json (ota.enabled = false)");
+        return false;
+    }
+
     // Check if display_variant is configured (required for OTA)
     String variant = ConfigManager::getDisplayVariant();
     if (variant.isEmpty()) {

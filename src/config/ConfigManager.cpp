@@ -66,6 +66,9 @@ void ConfigManager::setDefaults() {
 
     // Display policy defaults
     config.display_policy.skip_refresh_on_no_message = true;   // Save battery by only refreshing on new reactions
+
+    // OTA defaults
+    config.ota.enabled = true;  // OTA enabled by default for official devices
 }
 
 bool ConfigManager::begin() {
@@ -289,6 +292,12 @@ bool ConfigManager::loadFromJson(const String& jsonStr) {
         config.display_policy.skip_refresh_on_no_message = display_policy["skip_refresh_on_no_message"] | config.display_policy.skip_refresh_on_no_message;
     }
 
+    // Parse OTA section
+    if (doc["ota"].is<JsonObject>()) {
+        JsonObject ota = doc["ota"];
+        config.ota.enabled = ota["enabled"] | config.ota.enabled;
+    }
+
     loaded = true;
 
     // Validate display_variant is set (required for OTA updates)
@@ -432,6 +441,10 @@ String ConfigManager::toJson() {
     // Display policy section
     JsonObject display_policy = doc["display_policy"].to<JsonObject>();
     display_policy["skip_refresh_on_no_message"] = config.display_policy.skip_refresh_on_no_message;
+
+    // OTA section
+    JsonObject ota = doc["ota"].to<JsonObject>();
+    ota["enabled"] = config.ota.enabled;
 
     String output;
     serializeJsonPretty(doc, output);

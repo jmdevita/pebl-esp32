@@ -1491,9 +1491,10 @@ public:
             display->setCursor(x1_pos, y1_pos);
             display->print(line1);
 
-            // Secondary text: "PLEASE CHARGE" (regular font, centered)
+            // Secondary text: charge instruction (regular font, centered)
             display->setFont(&FreeSans9pt7b);
-            const char* line2 = "PLEASE CHARGE";
+            const char* line2 = "Charge, then press";
+            const char* line3 = "button to restart";
 
             uint16_t w2, h2;
             display->getTextBounds(line2, 0, 0, &x1, &y1, &w2, &h2);
@@ -1502,6 +1503,14 @@ public:
 
             display->setCursor(x2_pos, y2_pos);
             display->print(line2);
+
+            uint16_t w3, h3;
+            display->getTextBounds(line3, 0, 0, &x1, &y1, &w3, &h3);
+            int16_t x3_pos = (display->width() - w3) / 2;
+            int16_t y3_pos = y2_pos + 20;  // 20px below second line
+
+            display->setCursor(x3_pos, y3_pos);
+            display->print(line3);
 
         } while (display->nextPage());
 
@@ -2899,9 +2908,11 @@ void enterDeepSleep(uint32_t sleep_minutes) {
     // Display will hibernate and preserve current image (reaction or status message)
     // E-paper displays retain their image without power - this is the key advantage!
 
-    // Configure wake up timer
-    uint64_t sleep_time_us = sleep_minutes * 60 * 1000000ULL;
-    esp_sleep_enable_timer_wakeup(sleep_time_us);
+    // Configure wake up timer (0 = indefinite sleep, button-only wake)
+    if (sleep_minutes > 0) {
+        uint64_t sleep_time_us = sleep_minutes * 60 * 1000000ULL;
+        esp_sleep_enable_timer_wakeup(sleep_time_us);
+    }
 
     // Configure wake up on GPIO 39 button press (active LOW)
     // GPIO 39 is the built-in button on LilyGo T5 V2.3
@@ -2909,7 +2920,8 @@ void enterDeepSleep(uint32_t sleep_minutes) {
     esp_sleep_enable_ext0_wakeup(GPIO_NUM_39, 0);  // Wake when GPIO 39 goes LOW
 
     // Enter deep sleep
-    logMessage(LOG_INFO, "POWER", "Entering deep sleep now", "wake_sources=timer,button_gpio39");
+    const char* wakeSources = sleep_minutes > 0 ? "wake_sources=timer,button_gpio39" : "wake_sources=button_gpio39_only";
+    logMessage(LOG_INFO, "POWER", "Entering deep sleep now", wakeSources);
     delay(50);
     esp_deep_sleep_start();
 }
@@ -4543,8 +4555,8 @@ void setup() {
 
             // Only skip WiFi and sleep if sleep is enabled
             if (cfg.power.sleep_enabled) {
-                logMessage(LOG_INFO, "POWER", "Skipping WiFi and entering sleep to preserve battery");
-                enterDeepSleep(calculateSleepDuration());
+                logMessage(LOG_INFO, "POWER", "Critical low battery - entering indefinite sleep (button wake only)");
+                enterDeepSleep(0);
                 // Never returns, but for clarity:
                 return;
             } else {
@@ -4925,8 +4937,8 @@ void loop() {
 
             // Only enter deep sleep if sleep is enabled
             if (cfg.power.sleep_enabled) {
-                logMessage(LOG_INFO, "POWER", "Entering deep sleep to preserve battery");
-                enterDeepSleep(calculateSleepDuration());
+                logMessage(LOG_INFO, "POWER", "Critical low battery - entering indefinite sleep (button wake only)");
+                enterDeepSleep(0);
                 return;  // Never reached, but for clarity
             } else {
                 logMessage(LOG_INFO, "POWER", "Sleep disabled - staying awake despite low battery");
