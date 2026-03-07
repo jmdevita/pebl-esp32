@@ -230,6 +230,7 @@ bool ConfigManager::loadFromJson(const String& jsonStr) {
         config.server.port = server["port"] | config.server.port;
         config.server.path = server["path"] | config.server.path;
         config.server.use_ssl = server["use_ssl"] | config.server.use_ssl;
+        config.server.reconnect_jitter_max_sec = server["reconnect_jitter_max_sec"] | config.server.reconnect_jitter_max_sec;
     }
 
     // Parse display section
@@ -410,6 +411,7 @@ String ConfigManager::toJson() {
     server["port"] = config.server.port;
     server["path"] = config.server.path;
     server["use_ssl"] = config.server.use_ssl;
+    server["reconnect_jitter_max_sec"] = config.server.reconnect_jitter_max_sec;
 
     // Display section
     JsonObject display = doc["display"].to<JsonObject>();

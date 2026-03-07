@@ -44,6 +44,7 @@ struct AppConfig {
         uint16_t port;
         String path;
         bool use_ssl;
+        uint16_t reconnect_jitter_max_sec = 0;  // 0 = disabled (B2C default), set 30-60 for fleet deployments
     } server;
 
     // Display settings

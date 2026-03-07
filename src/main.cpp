@@ -38,7 +38,8 @@
 #include <HTTPClient.h>
 #include <PNGdec.h>
 #include <LittleFS.h>
-#include <time.h>  // For time_t, struct tm, gmtime()
+#include <time.h>      // For time_t, struct tm, gmtime(), strptime()
+#include <sys/time.h>  // For settimeofday(), gettimeofday()
 #include "ota/OTAManager.h"
 
 // ============================================================================
@@ -3072,7 +3073,16 @@ void handleWebSocketMessage(const uint8_t* payload, size_t length) {
         if (!otaCheckedThisBoot && !justWokeFromSleep) {
             otaCheckedThisBoot = true;
             logMessage(LOG_INFO, "OTA", "First connection established - checking for firmware updates");
-            delay(2000);  // DNS stabilization period
+            // Jitter boot OTA check to avoid thundering herd after mass power-on.
+            // Only applied when fleet jitter is enabled; single B2C devices skip the delay.
+            const AppConfig& jitterCfg = ConfigManager::getConfig();
+            if (jitterCfg.server.reconnect_jitter_max_sec > 0) {
+                uint32_t ota_jitter_ms = esp_random() % 60000;
+                char jitterBuf[32];
+                snprintf(jitterBuf, sizeof(jitterBuf), "jitter_ms=%lu", (unsigned long)ota_jitter_ms);
+                logMessage(LOG_INFO, "OTA", "Boot OTA check delayed", jitterBuf);
+                delay(ota_jitter_ms);
+            }
             checkForFirmwareUpdate();
             lastOTACheckMillis = millis();
         }
@@ -4464,6 +4474,27 @@ void setup() {
 
     const AppConfig& cfg = ConfigManager::getConfig();
 
+    // Set clock floor to firmware build date so the clock is never at 1970.
+    // On cold boot (or deep sleep wake with lost RTC), the ESP32 starts at epoch 0.
+    // This ensures timestamps in logs and on the display are "at least in the right year"
+    // before WiFi connects and the timezone API sets the real time.
+    {
+        struct tm build_tm = {};
+        strptime(__DATE__ " " __TIME__, "%b %d %Y %H:%M:%S", &build_tm);
+        time_t build_epoch = mktime(&build_tm);
+        struct timeval now_tv;
+        gettimeofday(&now_tv, NULL);
+        if (now_tv.tv_sec < build_epoch) {
+            struct timeval tv;
+            tv.tv_sec = build_epoch;
+            tv.tv_usec = 0;
+            settimeofday(&tv, NULL);
+            char logBuf[64];
+            snprintf(logBuf, sizeof(logBuf), "floor=%s %s", __DATE__, __TIME__);
+            logMessage(LOG_INFO, "TIME", "Clock set to build time", logBuf);
+        }
+    }
+
     // Set log level from config
     if (cfg.logging.default_level == "ERROR") currentLogLevel = LOG_ERROR;
     else if (cfg.logging.default_level == "WARN") currentLogLevel = LOG_WARN;
@@ -4779,8 +4810,25 @@ void setup() {
             }
         }
 
-        // Small delay before WebSocket connection
-        delay(2000);
+        // Jitter initial WebSocket connection to avoid thundering herd after mass power-on.
+        // Uses deterministic FNV-1a hash of device_id so the same device always gets the
+        // same delay — predictable for debugging, distributed across fleet.
+        {
+            uint32_t jitter_max_ms = (uint32_t)cfg.server.reconnect_jitter_max_sec * 1000;
+            if (jitter_max_ms > 0) {
+                uint32_t hash = 2166136261u;
+                for (const char *p = cfg.device.id.c_str(); *p; p++) {
+                    hash ^= (uint8_t)*p;
+                    hash *= 16777619u;
+                }
+                uint32_t jitter = hash % jitter_max_ms;
+                char jitterBuf[32];
+                snprintf(jitterBuf, sizeof(jitterBuf), "jitter_ms=%lu", (unsigned long)jitter);
+                logMessage(LOG_INFO, "WS", "Reconnect jitter", jitterBuf);
+                delay(jitter);
+            }
+        }
+        delay(2000);  // DNS stabilization delay
         SlackNetworkManager::connectWebSocket();
 
         // Initialize OTA manager (requires network connectivity)

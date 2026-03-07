@@ -20,7 +20,9 @@
     "host": "YOUR_SERVER_URL",
     "port": 443,
     "path": "/ws-stream",
-    "use_ssl": true
+    "use_ssl": true,
+    "reconnect_jitter_max_sec": 0,
+    "_comment_jitter": "reconnect_jitter_max_sec: 0 = disabled (set to 30 for fleet deployments of 50-100, 60 for 100+)"
   },
   "display": {
     "rotation": 1
