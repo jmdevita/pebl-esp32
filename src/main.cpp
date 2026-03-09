@@ -1350,10 +1350,10 @@ public:
             drawBatteryIndicator();
             drawPowerStatusIndicator();
 
-            // QR code on the left, below battery indicator row
+            // QR code on the left, below battery indicator row (extra padding to avoid crowding)
             const uint8_t scale = 2;
             const int16_t qrX = 5;
-            const int16_t qrY = 20;
+            const int16_t qrY = 28;
 
             for (uint8_t y = 0; y < qrcode.size; y++) {
                 for (uint8_t x = 0; x < qrcode.size; x++) {
