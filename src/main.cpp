@@ -155,6 +155,7 @@ namespace BatteryConstants {
 
     // Sleep thresholds
     constexpr int LOW_BATTERY_SLEEP_THRESHOLD = 15;        // Sleep immediately below 15% (balanced runtime vs longevity)
+    constexpr int LOW_BATTERY_RECOVERY_THRESHOLD = 20;     // Must reach 20% before exiting critical state (prevents oscillation at threshold)
     constexpr unsigned long GRACE_PERIOD_MS = 60000;       // 60s grace after switching to battery
     constexpr unsigned long MAX_BATTERY_RUNTIME_MS = 30000; // 30sec max runtime on battery (~16s listening after connection overhead)
 
@@ -249,17 +250,68 @@ namespace {  // Anonymous namespace for internal linkage
 // ============================================================================
 // RTC Memory - Survives Deep Sleep
 // ============================================================================
-// Store last reaction data in RTC memory so we can redraw it after deep sleep
+// Store last display content in RTC memory so we can redraw it after deep sleep.
+// Uses a discriminated union so any content type (reaction, broadcast, future types)
+// can be persisted and restored via restoreLastDisplay().
+enum DisplayContentType : uint8_t {
+    DISPLAY_CONTENT_NONE = 0,
+    DISPLAY_CONTENT_REACTION = 1,
+    DISPLAY_CONTENT_BROADCAST = 2,
+};
+
 RTC_DATA_ATTR struct {
-    bool hasReaction = false;
-    char emoji[32] = "";
-    char emojiUrl[128] = "";
-    char user[64] = "";
-    char channel[64] = "";
-    char message[128] = "";
-    char platform[16] = "";
-    bool isEncrypted = false;
-} lastReaction;
+    DisplayContentType contentType = DISPLAY_CONTENT_NONE;
+    union {
+        struct {
+            char emoji[32];
+            char emojiUrl[128];
+            char user[64];
+            char channel[64];
+            char message[128];
+            char platform[16];
+            bool isEncrypted;
+        } reaction;
+        struct {
+            char source[64];
+            char message[256];
+            char platform[16];
+            bool encrypted;
+        } broadcast;
+    };
+} lastDisplay;
+
+/** Save reaction data to RTC memory for persistence across deep sleep */
+static void saveReactionToRTC(const char* emoji, const char* emojiUrl, const char* user,
+                               const char* channel, const char* message, const char* platform,
+                               bool isEncrypted) {
+    lastDisplay.contentType = DISPLAY_CONTENT_REACTION;
+    strncpy(lastDisplay.reaction.emoji, emoji, sizeof(lastDisplay.reaction.emoji) - 1);
+    lastDisplay.reaction.emoji[sizeof(lastDisplay.reaction.emoji) - 1] = '\0';
+    strncpy(lastDisplay.reaction.emojiUrl, emojiUrl, sizeof(lastDisplay.reaction.emojiUrl) - 1);
+    lastDisplay.reaction.emojiUrl[sizeof(lastDisplay.reaction.emojiUrl) - 1] = '\0';
+    strncpy(lastDisplay.reaction.user, user, sizeof(lastDisplay.reaction.user) - 1);
+    lastDisplay.reaction.user[sizeof(lastDisplay.reaction.user) - 1] = '\0';
+    strncpy(lastDisplay.reaction.channel, channel, sizeof(lastDisplay.reaction.channel) - 1);
+    lastDisplay.reaction.channel[sizeof(lastDisplay.reaction.channel) - 1] = '\0';
+    strncpy(lastDisplay.reaction.message, message, sizeof(lastDisplay.reaction.message) - 1);
+    lastDisplay.reaction.message[sizeof(lastDisplay.reaction.message) - 1] = '\0';
+    strncpy(lastDisplay.reaction.platform, platform, sizeof(lastDisplay.reaction.platform) - 1);
+    lastDisplay.reaction.platform[sizeof(lastDisplay.reaction.platform) - 1] = '\0';
+    lastDisplay.reaction.isEncrypted = isEncrypted;
+}
+
+/** Save broadcast data to RTC memory for persistence across deep sleep */
+static void saveBroadcastToRTC(const char* source, const char* message, const char* platform,
+                                bool encrypted) {
+    lastDisplay.contentType = DISPLAY_CONTENT_BROADCAST;
+    strncpy(lastDisplay.broadcast.source, source, sizeof(lastDisplay.broadcast.source) - 1);
+    lastDisplay.broadcast.source[sizeof(lastDisplay.broadcast.source) - 1] = '\0';
+    strncpy(lastDisplay.broadcast.message, message, sizeof(lastDisplay.broadcast.message) - 1);
+    lastDisplay.broadcast.message[sizeof(lastDisplay.broadcast.message) - 1] = '\0';
+    strncpy(lastDisplay.broadcast.platform, platform, sizeof(lastDisplay.broadcast.platform) - 1);
+    lastDisplay.broadcast.platform[sizeof(lastDisplay.broadcast.platform) - 1] = '\0';
+    lastDisplay.broadcast.encrypted = encrypted;
+}
 
 // Track what the display is showing (survives deep sleep)
 RTC_DATA_ATTR bool displayShowingConnectionLost = false;
@@ -328,6 +380,7 @@ bool isDeviceIdle();
 void enterDeepSleep(uint32_t sleep_minutes);
 void enterPairingMode();
 void handleButtonHold(bool needsInit);
+static bool restoreLastDisplay();
 
 // ============================================================================
 // Display State Helper
@@ -864,6 +917,101 @@ public:
         updateDisplayStateAfterFullRefresh();
     }
 
+    /**
+     * Display a broadcast alert — text-only, full display width.
+     * No emoji image, no channel. Source name in bold, message word-wrapped below.
+     */
+    static void showBroadcast(const JsonObject& broadcast) {
+        const char* source = broadcast["user"] | "Alert";
+        const char* message = broadcast["message"] | "";
+        const char* platform = broadcast["platform"] | "";
+        bool isEncrypted = broadcast["encrypted"] | false;
+
+        char logBuf[128];
+        snprintf(logBuf, sizeof(logBuf), "source=%s encrypted=%s",
+                 source, isEncrypted ? "true" : "false");
+        logMessage(LOG_INFO, "DISPLAY", "Showing broadcast", logBuf);
+
+        displayShowingConnectionLost = false;
+        saveBroadcastToRTC(source, message, platform, isEncrypted);
+        logMessage(LOG_INFO, "RTC", "Saved broadcast to RTC memory for deep sleep recovery");
+
+        if (!display) return;
+
+        display->setFullWindow();
+        display->firstPage();
+        do {
+            display->fillScreen(GxEPD_WHITE);
+            display->setTextColor(GxEPD_BLACK);
+
+            // Battery indicator and power status in top strip
+            drawBatteryIndicator();
+            drawPowerStatusIndicator();
+
+            // Lock icon if encrypted
+            if (isEncrypted) {
+                drawLockIcon();
+            }
+
+            // Source name in bold at top (full width, no emoji offset)
+            display->setFont(&FreeSansBold9pt7b);
+            display->setCursor(10, 42);
+            display->print(source);
+
+            // Message body — regular font, word-wrap across up to 2 lines
+            display->setFont(&FreeSans9pt7b);
+            String msg(message);
+            if (msg.length() == 0) {
+                // Nothing to display
+            } else {
+                // Calculate approximate max chars per line (~25 for 250px wide display)
+                constexpr int maxChars = 28;
+                if ((int)msg.length() <= maxChars) {
+                    display->setCursor(10, 62);
+                    display->print(msg);
+                } else {
+                    // Word-wrap: find last space before maxChars
+                    int splitPos = msg.lastIndexOf(' ', maxChars);
+                    if (splitPos < 0) splitPos = maxChars;
+                    String line1 = msg.substring(0, splitPos);
+                    String line2 = msg.substring(splitPos);
+                    line2.trim();
+                    if ((int)line2.length() > maxChars) {
+                        line2 = line2.substring(0, maxChars - 3) + "...";
+                    }
+                    display->setCursor(10, 62);
+                    display->print(line1);
+                    display->setCursor(10, 80);
+                    display->print(line2);
+                }
+            }
+
+            // Platform label — small font, bottom-left
+            if (platform[0] != '\0') {
+                display->setFont(nullptr);
+                String plat(platform);
+                if (plat.length() > 0) {
+                    plat.setCharAt(0, toupper(plat.charAt(0)));
+                }
+                display->setCursor(10, display->height() - 8);
+                display->print(plat);
+            }
+
+            // "via Pebl" — small font, bottom-right
+            {
+                display->setFont(nullptr);
+                const char* via = "via Pebl";
+                int16_t vx, vy;
+                uint16_t vw, vh;
+                display->getTextBounds(via, 0, 0, &vx, &vy, &vw, &vh);
+                display->setCursor(display->width() - vw - 5, display->height() - 8);
+                display->print(via);
+            }
+        } while (display->nextPage());
+
+        updateDisplayStateAfterFullRefresh();
+    }
+
     // Branded splash screen: left half black, right half white, "pebl" wordmark centered
     // spanning both halves ("pe" in white on black, "bl" in black on white)
     static void showSplashScreen(const String& version) {
@@ -1105,20 +1253,7 @@ public:
 
         // Save reaction data to RTC memory for redraw after deep sleep
         displayShowingConnectionLost = false;
-        lastReaction.hasReaction = true;
-        strncpy(lastReaction.emoji, emoji, sizeof(lastReaction.emoji) - 1);
-        lastReaction.emoji[sizeof(lastReaction.emoji) - 1] = '\0';
-        strncpy(lastReaction.emojiUrl, emoji_url, sizeof(lastReaction.emojiUrl) - 1);
-        lastReaction.emojiUrl[sizeof(lastReaction.emojiUrl) - 1] = '\0';
-        strncpy(lastReaction.user, user, sizeof(lastReaction.user) - 1);
-        lastReaction.user[sizeof(lastReaction.user) - 1] = '\0';
-        strncpy(lastReaction.channel, channel, sizeof(lastReaction.channel) - 1);
-        lastReaction.channel[sizeof(lastReaction.channel) - 1] = '\0';
-        strncpy(lastReaction.message, message, sizeof(lastReaction.message) - 1);
-        lastReaction.message[sizeof(lastReaction.message) - 1] = '\0';
-        strncpy(lastReaction.platform, platform, sizeof(lastReaction.platform) - 1);
-        lastReaction.platform[sizeof(lastReaction.platform) - 1] = '\0';
-        lastReaction.isEncrypted = isEncrypted;
+        saveReactionToRTC(emoji, emoji_url, user, channel, message, platform, isEncrypted);
         logMessage(LOG_INFO, "RTC", "Saved reaction to RTC memory for deep sleep recovery");
 
         if (!display) return; // Safety check
@@ -1557,6 +1692,41 @@ private:
         return "...";
     }
 };
+
+/**
+ * Restore last displayed content from RTC memory.
+ * Dispatches to the correct renderer based on content type.
+ * Returns true if content was restored, false if nothing saved.
+ */
+static bool restoreLastDisplay() {
+    switch (lastDisplay.contentType) {
+    case DISPLAY_CONTENT_REACTION: {
+        logMessage(LOG_INFO, "RTC", "Restoring last reaction from RTC memory");
+        JsonDocument doc;
+        doc["emoji"] = lastDisplay.reaction.emoji;
+        doc["emoji_url"] = lastDisplay.reaction.emojiUrl;
+        doc["user"] = lastDisplay.reaction.user;
+        doc["channel"] = lastDisplay.reaction.channel;
+        doc["message"] = lastDisplay.reaction.message;
+        doc["platform"] = lastDisplay.reaction.platform;
+        doc["encrypted"] = lastDisplay.reaction.isEncrypted;
+        DisplayManager::showReaction(doc.as<JsonObject>());
+        return true;
+    }
+    case DISPLAY_CONTENT_BROADCAST: {
+        logMessage(LOG_INFO, "RTC", "Restoring last broadcast from RTC memory");
+        JsonDocument doc;
+        doc["user"] = lastDisplay.broadcast.source;
+        doc["message"] = lastDisplay.broadcast.message;
+        doc["platform"] = lastDisplay.broadcast.platform;
+        doc["encrypted"] = lastDisplay.broadcast.encrypted;
+        DisplayManager::showBroadcast(doc.as<JsonObject>());
+        return true;
+    }
+    default:
+        return false;
+    }
+}
 
 // ============================================================================
 // Display Hardware Initialization Helper
@@ -3094,21 +3264,12 @@ void handleWebSocketMessage(const uint8_t* payload, size_t length) {
         bool wasJustWoken = justWokeFromSleep;
         justWokeFromSleep = false;
 
-        if (displayShowingConnectionLost && lastReaction.hasReaction) {
-            // "Connection Lost" was displayed over the last reaction — re-render it
+        if (displayShowingConnectionLost && lastDisplay.contentType != DISPLAY_CONTENT_NONE) {
+            // "Connection Lost" was displayed over the last content — restore it
             displayShowingConnectionLost = false;
-            logMessage(LOG_INFO, "WS", "Reconnected - restoring last reaction");
-
-            JsonDocument restoreDoc;
-            restoreDoc["emoji"] = lastReaction.emoji;
-            restoreDoc["emoji_url"] = lastReaction.emojiUrl;
-            restoreDoc["user"] = lastReaction.user;
-            restoreDoc["channel"] = lastReaction.channel;
-            restoreDoc["message"] = lastReaction.message;
-            restoreDoc["platform"] = lastReaction.platform;
-            restoreDoc["encrypted"] = lastReaction.isEncrypted;
-            DisplayManager::showReaction(restoreDoc.as<JsonObject>());
-        } else if (!lastReaction.hasReaction && !wasJustWoken) {
+            logMessage(LOG_INFO, "WS", "Reconnected - restoring last display content");
+            restoreLastDisplay();
+        } else if (lastDisplay.contentType == DISPLAY_CONTENT_NONE && !wasJustWoken) {
             // First-ever connection AND not waking from sleep (wake block already refreshed).
             // Show the "waiting for reactions" screen since this is the initial connection.
             displayShowingConnectionLost = false;
@@ -3156,6 +3317,30 @@ void handleWebSocketMessage(const uint8_t* payload, size_t length) {
             logMessage(LOG_WARN, "WS", "Message missing message_id field");
         }
 
+        return;
+    }
+
+    if (strcmp(msgType, "broadcast") == 0) {
+        metrics.messagesReceived++;
+        logMessage(LOG_INFO, "WS", "Broadcast received");
+
+        const char* messageId = doc["message_id"];
+        JsonObject broadcast = doc.as<JsonObject>();
+        DisplayManager::showBroadcast(broadcast);
+        lastReactionTime = millis();
+
+        // Send ACK back to server
+        if (messageId && wsConnected) {
+            JsonDocument ackDoc;
+            ackDoc["type"] = "ack";
+            ackDoc["id"] = messageId;
+            String ackJson;
+            serializeJson(ackDoc, ackJson);
+            webSocket.sendTXT(ackJson);
+
+            snprintf(logBuf, sizeof(logBuf), "id=%s", messageId);
+            logMessage(LOG_DEBUG, "WS", "ACK sent", logBuf);
+        }
         return;
     }
 
@@ -4572,13 +4757,21 @@ void setup() {
     // CRITICAL: Check for low battery on wake BEFORE WiFi connection
     // WiFi is the most power-hungry operation (~10s × 180mA = 0.5mAh per wake cycle)
     // Show warning and optionally skip WiFi/sleep if battery is critically low
+    //
+    // Hysteresis: If we previously entered critical sleep (hasShownLowBatteryWarning),
+    // require battery to reach RECOVERY threshold (20%) before allowing boot.
+    // This prevents oscillation where voltage sag under WiFi load drops below 15%,
+    // device sleeps, voltage recovers to 16%, device boots, WiFi drops it again, repeat.
     if (isWakeFromSleep && !usbPowered) {
         using namespace BatteryConstants;
-        if (startupBattery.percentage >= 0 && startupBattery.percentage < LOW_BATTERY_SLEEP_THRESHOLD) {
+        int effectiveThreshold = hasShownLowBatteryWarning
+            ? LOW_BATTERY_RECOVERY_THRESHOLD   // Previously critical: require 20% to exit
+            : LOW_BATTERY_SLEEP_THRESHOLD;     // Normal wake: 15% entry threshold
+        if (startupBattery.percentage >= 0 && startupBattery.percentage < effectiveThreshold) {
             char logBuf[128];
-            snprintf(logBuf, sizeof(logBuf), "battery=%d%% voltage=%.2fV sleep_enabled=%s",
+            snprintf(logBuf, sizeof(logBuf), "battery=%d%% voltage=%.2fV threshold=%d%% sleep_enabled=%s",
                      startupBattery.percentage, startupBattery.voltage,
-                     cfg.power.sleep_enabled ? "true" : "false");
+                     effectiveThreshold, cfg.power.sleep_enabled ? "true" : "false");
             logMessage(LOG_WARN, "POWER", "Critical low battery on wake", logBuf);
 
             // Show warning screen (regardless of sleep_enabled setting)
@@ -4645,7 +4838,7 @@ void setup() {
 
             if (cfg.display_policy.skip_refresh_on_no_message) {
                 // Smart refresh strategy
-                if (!lastReaction.hasReaction && !hasShownBlankScreen) {
+                if (lastDisplay.contentType == DISPLAY_CONTENT_NONE && !hasShownBlankScreen) {
                     // First boot (never shown blank screen) - show it once
                     shouldRefreshDisplay = true;
                     logMessage(LOG_INFO, "DISPLAY", "First boot - will show blank screen with status bar");
@@ -4670,21 +4863,11 @@ void setup() {
 
             // Perform display refresh if needed
             if (shouldRefreshDisplay && display) {
-                if (lastReaction.hasReaction) {
-                    // Redraw last reaction from RTC memory
-                    logMessage(LOG_INFO, "RTC", "Redrawing last reaction from RTC memory");
-
-                    JsonDocument doc;
-                    doc["emoji"] = lastReaction.emoji;
-                    doc["emoji_url"] = lastReaction.emojiUrl;
-                    doc["user"] = lastReaction.user;
-                    doc["channel"] = lastReaction.channel;
-                    doc["message"] = lastReaction.message;
-                    doc["platform"] = lastReaction.platform;
-                    doc["encrypted"] = lastReaction.isEncrypted;
-
-                    DisplayManager::showReaction(doc.as<JsonObject>());
-                    logMessage(LOG_INFO, "DISPLAY", "Successfully restored reaction after wake");
+                if (lastDisplay.contentType != DISPLAY_CONTENT_NONE) {
+                    // Redraw last content from RTC memory
+                    logMessage(LOG_INFO, "RTC", "Redrawing last display content from RTC memory");
+                    restoreLastDisplay();
+                    logMessage(LOG_INFO, "DISPLAY", "Successfully restored display content after wake");
                 } else {
                     // No saved reaction - show blank screen with just top bar
                     logMessage(LOG_INFO, "RTC", "No saved reaction - showing blank screen with status bar");
@@ -5025,16 +5208,8 @@ void loop() {
                 } else if (display) {
                     // NOT safe for partial - need full refresh
                     logMessage(LOG_INFO, "DISPLAY", "Full refresh required - redrawing saved reaction with BATTERY");
-                    if (lastReaction.hasReaction) {
-                        JsonDocument doc;
-                        doc["emoji"] = lastReaction.emoji;
-                        doc["emoji_url"] = lastReaction.emojiUrl;
-                        doc["user"] = lastReaction.user;
-                        doc["channel"] = lastReaction.channel;
-                        doc["message"] = lastReaction.message;
-                        doc["platform"] = lastReaction.platform;
-                        doc["encrypted"] = lastReaction.isEncrypted;
-                        DisplayManager::showReaction(doc.as<JsonObject>());
+                    if (lastDisplay.contentType != DISPLAY_CONTENT_NONE) {
+                        restoreLastDisplay();
                     } else {
                         // Show blank screen with BATTERY
                         display->setFullWindow();
@@ -5077,16 +5252,8 @@ void loop() {
                 } else if (display) {
                     // NOT safe for partial - need full refresh
                     logMessage(LOG_INFO, "DISPLAY", "Full refresh required - redrawing saved reaction without BATTERY");
-                    if (lastReaction.hasReaction) {
-                        JsonDocument doc;
-                        doc["emoji"] = lastReaction.emoji;
-                        doc["emoji_url"] = lastReaction.emojiUrl;
-                        doc["user"] = lastReaction.user;
-                        doc["channel"] = lastReaction.channel;
-                        doc["message"] = lastReaction.message;
-                        doc["platform"] = lastReaction.platform;
-                        doc["encrypted"] = lastReaction.isEncrypted;
-                        DisplayManager::showReaction(doc.as<JsonObject>());
+                    if (lastDisplay.contentType != DISPLAY_CONTENT_NONE) {
+                        restoreLastDisplay();
                     } else {
                         // Show blank screen without BATTERY
                         display->setFullWindow();
