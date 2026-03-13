@@ -275,6 +275,7 @@ RTC_DATA_ATTR struct {
             char source[64];
             char message[256];
             char platform[16];
+            char channel[64];
             bool encrypted;
         } broadcast;
     };
@@ -302,7 +303,7 @@ static void saveReactionToRTC(const char* emoji, const char* emojiUrl, const cha
 
 /** Save broadcast data to RTC memory for persistence across deep sleep */
 static void saveBroadcastToRTC(const char* source, const char* message, const char* platform,
-                                bool encrypted) {
+                                const char* channel, bool encrypted) {
     lastDisplay.contentType = DISPLAY_CONTENT_BROADCAST;
     strncpy(lastDisplay.broadcast.source, source, sizeof(lastDisplay.broadcast.source) - 1);
     lastDisplay.broadcast.source[sizeof(lastDisplay.broadcast.source) - 1] = '\0';
@@ -310,6 +311,8 @@ static void saveBroadcastToRTC(const char* source, const char* message, const ch
     lastDisplay.broadcast.message[sizeof(lastDisplay.broadcast.message) - 1] = '\0';
     strncpy(lastDisplay.broadcast.platform, platform, sizeof(lastDisplay.broadcast.platform) - 1);
     lastDisplay.broadcast.platform[sizeof(lastDisplay.broadcast.platform) - 1] = '\0';
+    strncpy(lastDisplay.broadcast.channel, channel, sizeof(lastDisplay.broadcast.channel) - 1);
+    lastDisplay.broadcast.channel[sizeof(lastDisplay.broadcast.channel) - 1] = '\0';
     lastDisplay.broadcast.encrypted = encrypted;
 }
 
@@ -921,10 +924,27 @@ public:
      * Display a broadcast alert — text-only, full display width.
      * No emoji image, no channel. Source name in bold, message word-wrapped below.
      */
+    /**
+     * Display a broadcast alert — structured card layout with header bar and message box.
+     * Layout:
+     *   +--------------------------------------------------+
+     *   | [lock]         BATTERY          [ooo]            |
+     *   | ████████████████████████████████████████████████ |
+     *   | █     #channel  ·  Announcement                █ |
+     *   | ████████████████████████████████████████████████ |
+     *   | ┌──────────────────────────────────────────────┐ |
+     *   | │           Source Name (bold)                 │ |
+     *   | │      Message line 1 (centered)              │ |
+     *   | │      Message line 2 (centered)              │ |
+     *   | └──────────────────────────────────────────────┘ |
+     *   | Platform                                        |
+     *   +--------------------------------------------------+
+     */
     static void showBroadcast(const JsonObject& broadcast) {
         const char* source = broadcast["user"] | "Alert";
         const char* message = broadcast["message"] | "";
         const char* platform = broadcast["platform"] | "";
+        const char* channel = broadcast["channel"] | "";
         bool isEncrypted = broadcast["encrypted"] | false;
 
         char logBuf[128];
@@ -933,10 +953,19 @@ public:
         logMessage(LOG_INFO, "DISPLAY", "Showing broadcast", logBuf);
 
         displayShowingConnectionLost = false;
-        saveBroadcastToRTC(source, message, platform, isEncrypted);
+        saveBroadcastToRTC(source, message, platform, channel, isEncrypted);
         logMessage(LOG_INFO, "RTC", "Saved broadcast to RTC memory for deep sleep recovery");
 
         if (!display) return;
+
+        // Layout constants
+        const int16_t margin = 5;
+        const int16_t dw = display->width();
+        const int16_t headerY = 26;
+        const int16_t headerH = 20;
+        const int16_t boxY = headerY + headerH;
+        const int16_t boxH = 58;
+        const int16_t boxInnerW = dw - 2 * margin;
 
         display->setFullWindow();
         display->firstPage();
@@ -948,41 +977,82 @@ public:
             drawBatteryIndicator();
             drawPowerStatusIndicator();
 
-            // Lock icon if encrypted
             if (isEncrypted) {
                 drawLockIcon();
             }
 
-            // Source name in bold at top (full width, no emoji offset)
-            display->setFont(&FreeSansBold9pt7b);
-            display->setCursor(10, 42);
-            display->print(source);
+            // Header bar — filled black rectangle with white centered text
+            display->fillRect(margin, headerY, boxInnerW, headerH, GxEPD_BLACK);
+            {
+                display->setFont(nullptr);
+                display->setTextColor(GxEPD_WHITE);
 
-            // Message body — regular font, word-wrap across up to 2 lines
-            display->setFont(&FreeSans9pt7b);
-            String msg(message);
-            if (msg.length() == 0) {
-                // Nothing to display
-            } else {
-                // Calculate approximate max chars per line (~25 for 250px wide display)
-                constexpr int maxChars = 28;
-                if ((int)msg.length() <= maxChars) {
-                    display->setCursor(10, 62);
-                    display->print(msg);
+                char headerText[96];
+                if (channel[0] != '\0') {
+                    snprintf(headerText, sizeof(headerText), "#%s  %c  Announcement",
+                             channel, (char)0xF9);  // 0xF9 = middle dot in default font
                 } else {
-                    // Word-wrap: find last space before maxChars
-                    int splitPos = msg.lastIndexOf(' ', maxChars);
-                    if (splitPos < 0) splitPos = maxChars;
-                    String line1 = msg.substring(0, splitPos);
-                    String line2 = msg.substring(splitPos);
-                    line2.trim();
-                    if ((int)line2.length() > maxChars) {
-                        line2 = line2.substring(0, maxChars - 3) + "...";
+                    snprintf(headerText, sizeof(headerText), "Announcement");
+                }
+
+                int16_t tx, ty;
+                uint16_t tw, th;
+                display->getTextBounds(headerText, 0, 0, &tx, &ty, &tw, &th);
+                int16_t hx = margin + (boxInnerW - (int16_t)tw) / 2;
+                int16_t hy = headerY + (headerH - (int16_t)th) / 2 - ty;
+                display->setCursor(hx, hy);
+                display->print(headerText);
+
+                display->setTextColor(GxEPD_BLACK);
+            }
+
+            // Message box — outlined rectangle below header bar
+            display->drawRect(margin, boxY, boxInnerW, boxH, GxEPD_BLACK);
+
+            // Source name — bold, centered inside the box
+            display->setFont(&FreeSansBold9pt7b);
+            {
+                int16_t sx, sy;
+                uint16_t sw, sh;
+                display->getTextBounds(source, 0, 0, &sx, &sy, &sw, &sh);
+                display->setCursor(margin + (boxInnerW - (int16_t)sw) / 2, boxY + 16);
+                display->print(source);
+            }
+
+            // Message body — regular font, word-wrap across up to 2 lines, centered
+            display->setFont(&FreeSans9pt7b);
+            {
+                String msg(message);
+                if (msg.length() > 0) {
+                    constexpr int maxChars = 28;
+                    if ((int)msg.length() <= maxChars) {
+                        int16_t mx, my;
+                        uint16_t mw, mh;
+                        display->getTextBounds(msg.c_str(), 0, 0, &mx, &my, &mw, &mh);
+                        display->setCursor(margin + (boxInnerW - (int16_t)mw) / 2, boxY + 34);
+                        display->print(msg);
+                    } else {
+                        int splitPos = msg.lastIndexOf(' ', maxChars);
+                        if (splitPos < 0) splitPos = maxChars;
+                        String line1 = msg.substring(0, splitPos);
+                        String line2 = msg.substring(splitPos);
+                        line2.trim();
+                        if ((int)line2.length() > maxChars) {
+                            line2 = line2.substring(0, maxChars - 3) + "...";
+                        }
+
+                        // Line 1 centered
+                        int16_t lx, ly;
+                        uint16_t lw, lh;
+                        display->getTextBounds(line1.c_str(), 0, 0, &lx, &ly, &lw, &lh);
+                        display->setCursor(margin + (boxInnerW - (int16_t)lw) / 2, boxY + 34);
+                        display->print(line1);
+
+                        // Line 2 centered
+                        display->getTextBounds(line2.c_str(), 0, 0, &lx, &ly, &lw, &lh);
+                        display->setCursor(margin + (boxInnerW - (int16_t)lw) / 2, boxY + 52);
+                        display->print(line2);
                     }
-                    display->setCursor(10, 62);
-                    display->print(line1);
-                    display->setCursor(10, 80);
-                    display->print(line2);
                 }
             }
 
@@ -995,17 +1065,6 @@ public:
                 }
                 display->setCursor(10, display->height() - 8);
                 display->print(plat);
-            }
-
-            // "via Pebl" — small font, bottom-right
-            {
-                display->setFont(nullptr);
-                const char* via = "via Pebl";
-                int16_t vx, vy;
-                uint16_t vw, vh;
-                display->getTextBounds(via, 0, 0, &vx, &vy, &vw, &vh);
-                display->setCursor(display->width() - vw - 5, display->height() - 8);
-                display->print(via);
             }
         } while (display->nextPage());
 
@@ -1719,6 +1778,7 @@ static bool restoreLastDisplay() {
         doc["user"] = lastDisplay.broadcast.source;
         doc["message"] = lastDisplay.broadcast.message;
         doc["platform"] = lastDisplay.broadcast.platform;
+        doc["channel"] = lastDisplay.broadcast.channel;
         doc["encrypted"] = lastDisplay.broadcast.encrypted;
         DisplayManager::showBroadcast(doc.as<JsonObject>());
         return true;
